@@ -1,0 +1,5 @@
+Lancer un terminal dans le dossier de "Index.html"
+py -m http.server 8000
+
+
+adresse web : http://localhost:8000/index.html
