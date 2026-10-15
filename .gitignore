@@ -1,3 +1,9 @@
 desktop.ini
 Thumbs.db
 .DS_Store
+
+# Sauvegarde locale de l'ancien code
+OLD/
+
+# Document de suivi interne
+Suivie des amélioration.xlsx

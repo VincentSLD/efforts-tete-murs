@@ -34,7 +34,7 @@ import {
 } from "three/examples/jsm/renderers/CSS2DRenderer";
 
 // Numéro de version de l'appli (à incrémenter à chaque itération)
-const APP_VERSION = "V1.1.34";
+const APP_VERSION = "V1.2.00";
 
 // --- ÉTAT GLOBAL SIMPLIFIÉ -------------------------------------------------
 
@@ -65,12 +65,19 @@ const state = {
   },
   // Pour les murs à plusieurs hauteurs : segment de hauteur sélectionné par mur (index dans heightSegments / heightSegmentsDetail)
   selectedWallSegments: {}, // murId -> segmentIndex (0,1,2,...)
-  // Configuration fine par arase de mur : murs[murId][araseIndex] = { enabled, slabs: { slabId: { enabled, stacks: [bool,bool,bool] } }, stackRefs: { 1: { refHaute, refBasse, userHaute, userBasse } } }
+  // Ancien modèle (migration) : wallAraseConfig.murs[murId][araseIndex] = { enabled, slabs, stackRefs }
   wallAraseConfig: {
     murs: {},
   },
-  // Configuration par poutre / dalle : poutres[poutreId][slabId] = { enabled, stacks: [bool,bool,bool] }
+  // Nouveau modèle association mur : murs[murId] = { stackCount: 0..10, stacks: [{ refHaute, refBasse, userHaute, userBasse, slabs: { [slabId]: bool } }] }
+  // Stack sans dalle cochée = effort calculé (masse mur seule).
+  wallCalcConfig: {
+    murs: {},
+  },
+  // Configuration par poutre / dalle : poutres[poutreId][slabId] = { enabled, stacks: [bool,bool,bool], takeMass?: bool }
   poutreStackConfig: {},
+  // Affichage temporaire des arases colorées (légende) : murId | null
+  araseLegendMurId: null,
   // Résultats calcul : murId -> { stable:boolean }
   massStabilityByMur: {},
   // Résultats calcul : poutreId -> { stable:boolean }
@@ -150,6 +157,9 @@ const mainLayout = document.querySelector("main");
 const charpenteAttrsPanel = document.getElementById("charpente-attributes-panel");
 const charpenteSelectedInfo = document.getElementById("charpente-selected-info");
 const charpenteSensSelect = document.getElementById("charpente-sens");
+const charpenteSensToggle = document.getElementById("charpente-sens-toggle");
+const charpenteSensMenu = document.getElementById("charpente-sens-menu");
+const charpenteSensDropdown = document.getElementById("charpente-sens-dropdown");
 const charpenteMatCharpente = document.getElementById("charpente-mat-charpente");
 const charpenteMatVolige = document.getElementById("charpente-mat-volige");
 const charpenteMatCouverture = document.getElementById("charpente-mat-couverture");
@@ -411,6 +421,9 @@ updateSeismicFactorsFromSelectors();
 
 // --- Onglets paramètres / matériaux ------------------------------------------
 function setActiveMainTab(target) {
+  if (typeof clearAraseLegendBoxes === "function") {
+    try { clearAraseLegendBoxes(); } catch (_) {}
+  }
   const previousTab = currentMainTab;
   currentMainTab = target;
   tabButtons.forEach((b) => b.classList.remove("active"));
@@ -557,12 +570,14 @@ btnExportMassesExcel?.addEventListener("click", () => {
   const header = [
     "Type",
     "ID",
-    "Arase",
-    "H arase [m]",
     "Stack",
+    "Réf. haute",
+    "Réf. basse",
     "Dalles",
     "H dalle (top) [m]",
     "H calc mur [m]",
+    "Mode hcalc",
+    "Avertissement",
     "Mat / densité",
     "Masse mur [daN]",
     "Masse dalles [daN]",
@@ -580,12 +595,14 @@ btnExportMassesExcel?.addEventListener("click", () => {
     lines.push([
       r.type,
       r.id,
-      r.arase ?? "",
-      r.hArase ?? "",
       r.stack ?? "",
+      r.refHaute ?? "",
+      r.refBasse ?? "",
       r.dalles ?? "",
       r.hDalleTop ?? "",
       r.hCalcMur ?? "",
+      r.hCalcNote ?? "",
+      r.softWarning ?? "",
       r.mat ?? "",
       r.masseMur ?? "",
       r.masseDalles ?? "",
@@ -630,42 +647,43 @@ btnExportNoteCalculPdf?.addEventListener("click", async () => {
     <h2>Rappels de méthode</h2>
     <ul class="muted">
       <li>Masse charpente par m² : G + ψ·Q (ψ = facteur charges d’exploitation, dépend de la catégorie de charges).</li>
-      <li>Demi-portée prise sur l’axe porteur (X ou Y en plan) ; 0,5 m si le mur/poutre n’est pas considéré porteur de la dalle.</li>
+      <li>Demi-portée charpente : si le sens porteur est (quasi) perpendiculaire au mur → demi-portée × |sin&nbsp;φ| (φ = angle axe mur / sens dalle ; à 45° ≈ 0,707×demi-portée). Si non porteur (sens trop parallèle, |sin&nbsp;φ|&nbsp;&lt;&nbsp;0,5) → <b>1&nbsp;m mini</b> de charge dalle.</li>
       <li>Effort en tête (par mètre linéaire) : Total × S_d(T) / g_r (S_d(T)=${sdT.toFixed(2)} m/s², g_r=${g.toFixed(2)} m/s²).</li>
       <li>Auto-stabilité chaînage : F_res = min(F_M, F_f) comparé à l’effort en tête ; nombre d’ancrages = découpe en N travées jusqu’à F_res ≥ F_tête.</li>
       <li>Double chaînage (murs pignon/rampant) : un second « Type de chaînage en rampant/pignon » peut être défini en plus du chaînage horizontal. Il est utilisé dans le calcul de F_res (et donc dans le nombre d’ancrages requis) dès que le mur est classé « Pignon » ou « Rampant » <b>ET</b> que l’un des deux critères suivants est satisfait : (a) le stack a réf. haute = réf. basse = « Pointe de pignon » ; (b) le stack contient au moins une dalle géométriquement rampante (variation d’altitude ≥ 10 cm) — colonne « Forme » du tableau dalles dans l’onglet *Définir modèle*. Pour un mur « Rive », le chaînage horizontal est toujours utilisé, même si la dalle associée est rampante.</li>
     </ul>
 
     <h2>Comment sont construits les cas mur</h2>
-    <p class="muted">Pour chaque mur, on génère un cas par couple (<b>arase</b>, <b>stack</b>) actif :</p>
+    <p class="muted">Pour chaque mur, on génère un cas par <b>stack</b> (1 à 10) défini dans l’association :</p>
     <ul class="muted">
-      <li><b>Arase</b> : tronçon de mur identifié à partir des sauts en plan (segmentation IFC). Une arase = un niveau d’interface tête de mur (ou bas-de-pente / pointe pour un pignon).</li>
-      <li><b>Stack</b> : empilement logique (1, 2 ou 3) de dalles cochées sur une même arase. Toutes les dalles d’un même stack sont supposées au même niveau (= référence centrale du calcul).</li>
-      <li><b>Référence centrale (y<sub>C</sub>)</b> = interface haute des dalles du stack (max si plusieurs). Pour un pignon avec dalles rampantes ou réf. haute « Bas / Pointe de pignon », y<sub>C</sub> est aligné sur la réf. haute résolue.</li>
-      <li><b>Référence haute / basse</b> : choisies par stack (menu). Possibles : Arase du mur, Pied de mur, Dalle la plus haute/basse du stack, Dalle n° XXX, Donnée utilisateur, et (pignon) Pointe / Bas de pignon.</li>
+      <li><b>Stack</b> : cas de calcul indépendant avec ses réf. haute/basse et ses dalles cochées (éventuellement aucune → masse mur seule).</li>
+      <li><b>Référence centrale (y<sub>C</sub>)</b> = interface haute des dalles du stack (max si plusieurs), ou moyenne des réfs si aucune dalle. Pour un pignon/rampant avec dalles rampantes ou réf. haute « Bas / Pointe », y<sub>C</sub> est aligné sur la réf. haute résolue.</li>
+      <li><b>Référence haute / basse</b> : choisies par stack. Haute : Arase, Pied, Dalles, Donnée utilisateur (L<sub>h</sub>), Pointe / Bas de pente. Basse : géométrique uniquement (Pied, Dalles, Pointe / Bas de pente) — plus d’option utilisateur.</li>
     </ul>
 
     <h3>Hauteur équivalente de mur h<sub>calc</sub></h3>
-    <p class="muted">h<sub>calc</sub> = h<sub>bas</sub> + h<sub>haut</sub> autour de y<sub>C</sub> :</p>
+    <p class="muted">Par défaut : h<sub>calc</sub> = h<sub>bas</sub> + h<sub>haut</sub> autour de y<sub>C</sub>.</p>
     <ul class="muted">
-      <li><b>Réf. basse</b> : si « Donnée utilisateur » → L<sub>user</sub>/2 ; si la réf. coïncide avec la pointe → 0 ; sinon (y<sub>C</sub> − y<sub>basse</sub>)/2 (si la réf. est sous y<sub>C</sub>).</li>
-      <li><b>Réf. haute</b> :
+      <li><b>Réf. basse</b> (toujours géométrique) : si la réf. coïncide avec la pointe → 0 ; sinon (y<sub>C</sub> − y<sub>basse</sub>)/2 si sous y<sub>C</sub>. La réf. basse sert aussi à contrôler L<sub>h</sub> en mode utilisateur.</li>
+      <li><b>Réf. haute = Donnée utilisateur</b> (prioritaire, sauf Pointe/Pointe) : on saisit la hauteur relative L<sub>h</sub> ; h<sub>calc</sub> = L<sub>h</sub>/2. Cette hauteur remplace uniquement la masse mur ; les dalles cochées restent dans le calcul de masse dalle. Soft-warning si L<sub>h</sub> &gt; hauteur mur au-dessus de la réf. basse (limite affichée, non bloquant).</li>
+      <li><b>Autres réf. haute</b> :
         <ul>
           <li><b>Arase du mur (libre en tête)</b> : (y<sub>arase</sub> − y<sub>C</sub>) plein, sans ÷2.</li>
           <li><b>Pointe de pignon</b> : (y<sub>pointe</sub> − y<sub>C</sub>) / 3.</li>
           <li><b>Bas de pignon</b> : 0 (y<sub>C</sub> aligné sur bas-de-pente).</li>
-          <li><b>Donnée utilisateur</b> : L<sub>user</sub>/2.</li>
           <li><b>Dalle (max/min/numérotée)</b> : (y<sub>haute</sub> − y<sub>C</sub>)/2.</li>
         </ul>
       </li>
     </ul>
 
     <h3>Cas particulier pignon : Pointe / Pointe</h3>
-    <p class="muted">Quand réf. haute = réf. basse = « Pointe de pignon » :</p>
+    <p class="muted">Quand réf. haute = réf. basse = « Pointe de pignon » (formule Excel) :</p>
     <ul class="muted">
-      <li>Aire triangulaire au-dessus de y<sub>C</sub> : A<sub>tri</sub> = 0,5 × L<sub>mur</sub> × H<sub>pointe</sub>.</li>
-      <li>Effort ponctuel (sans charpente) : F<sub>pointe</sub> = 0,65 · A<sub>tri</sub> · ρ<sub>mur</sub> · t · S<sub>d</sub>/g_r.</li>
-      <li>Masse linéique mur retenue : F<sub>pointe</sub>/L<sub>mur</sub> (masse dalle non comptée).</li>
+      <li>H<sub>t</sub> = y<sub>pointe</sub> − y<sub>dalle max mur</sub> (hauteur de pointe au-dessus de la dalle, pas le mur total).</li>
+      <li>Pente (%) mesurée sur le profil haut du mur : (y<sub>pointe</sub> − y<sub>bas</sub>) / (L<sub>mur</sub>/2) × 100.</li>
+      <li>h<sub>eq</sub> = H<sub>t</sub>/3 × 2 = 2/3 · H<sub>t</sub> ; G<sub>mur</sub> = ρ · t.</li>
+      <li>Effort total : F<sub>tot</sub> = (h<sub>eq</sub>/(pente/100)) · h<sub>eq</sub> · G<sub>mur</sub> · S<sub>d</sub>/g<sub>r</sub>.</li>
+      <li>Effort linéique : F<sub>lin</sub> = G<sub>mur</sub> · h<sub>eq</sub> · S<sub>d</sub>/g<sub>r</sub> (les deux apparaissent en vue du dessus). Masse dalle non comptée.</li>
     </ul>
 
     <h3>Dalles rampantes</h3>
@@ -678,12 +696,20 @@ btnExportNoteCalculPdf?.addEventListener("click", async () => {
     .map((r) => `<tr>
       <td>${escapeHtml(r.type)}</td>
       <td class="num">${escapeHtml(r.id)}</td>
-      <td class="num">${escapeHtml(r.arase ?? "—")}</td>
-      <td class="num">${formatNum(r.hArase)}</td>
       <td class="num">${escapeHtml(r.stack ?? "—")}</td>
+      <td>${escapeHtml(r.refHaute ?? "—")}</td>
+      <td>${escapeHtml(r.refBasse ?? "—")}</td>
       <td>${escapeHtml(r.dalles)}</td>
       <td class="num">${formatNum(r.hDalleTop)}</td>
-      <td class="num">${formatNum(r.hCalcMur)}</td>
+      <td class="num">${formatNum(r.hCalcMur)}${
+        r.hCalcNote
+          ? `<div style="font-size:0.65rem;color:#334155;font-weight:600;">${escapeHtml(r.hCalcNote)}</div>`
+          : ""
+      }${
+        r.softWarning
+          ? `<div style="font-size:0.62rem;color:#b45309;">⚠ ${escapeHtml(r.softWarning)}</div>`
+          : ""
+      }</td>
       <td>${escapeHtml(r.mat ?? "—")}</td>
       <td class="num">${formatDaN(r.masseMur)}</td>
       <td class="num">${formatDaN(r.masseDalles)}</td>
@@ -705,9 +731,9 @@ btnExportNoteCalculPdf?.addEventListener("click", async () => {
        <thead><tr>
          <th>Type</th>
          <th class="num">ID</th>
-         <th class="num">Arase</th>
-         <th class="num">H arase [m]</th>
          <th class="num">Stack</th>
+         <th>Réf. haute</th>
+         <th>Réf. basse</th>
          <th>Dalles</th>
          <th class="num">H dalle (top) [m]</th>
          <th class="num">H calc mur [m]</th>
@@ -852,7 +878,7 @@ function buildEffortsTopViewSVG() {
 
   if (!wallCases.length && !beamCases.length) return null;
 
-  // Bbox modèle (plan XZ) sur tous les murs / dalles / poutres connus
+  // Emprise modèle (plan XZ) — hull / OBB via getElementPlanCornersXZ
   let minX = Infinity, maxX = -Infinity, minZ = Infinity, maxZ = -Infinity;
   state.importedElements.forEach((el) => {
     if (
@@ -860,17 +886,14 @@ function buildEffortsTopViewSVG() {
       !matchesCategory(el, "charpente") &&
       !matchesCategory(el, "poutres")
     ) return;
-    const x = toNumberMaybe(el.x);
-    const z = toNumberMaybe(el.z);
-    if (x == null || z == null) return;
-    const L = toNumberMaybe(el.length) || 0;
-    const P = toNumberMaybe(el.width) || 0;
-    const hX = L / 2;
-    const hZ = P / 2;
-    if (x - hX < minX) minX = x - hX;
-    if (x + hX > maxX) maxX = x + hX;
-    if (z - hZ < minZ) minZ = z - hZ;
-    if (z + hZ > maxZ) maxZ = z + hZ;
+    const corners = getElementPlanCornersXZ(el);
+    if (!corners?.length) return;
+    for (const c of corners) {
+      if (c.x < minX) minX = c.x;
+      if (c.x > maxX) maxX = c.x;
+      if (c.z < minZ) minZ = c.z;
+      if (c.z > maxZ) maxZ = c.z;
+    }
   });
   if (!Number.isFinite(minX) || !Number.isFinite(maxX) || !Number.isFinite(minZ) || !Number.isFinite(maxZ)) return null;
 
@@ -912,56 +935,42 @@ function buildEffortsTopViewSVG() {
     <marker id="arr-purple" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#7e22ce"/></marker>
   </defs>`);
 
+  /** Polygone SVG d'un élément orienté (dirU/dirV) ou AABB fallback. */
+  const orientedPolyPoints = (el) => {
+    const corners = getElementPlanCornersXZ(el);
+    if (!corners?.length) return null;
+    return corners.map((c) => `${projX(c.x)},${projZ(c.z)}`).join(" ");
+  };
+
   // Dalles en fond clair
   state.importedElements.filter((e) => matchesCategory(e, "charpente")).forEach((el) => {
-    const x = toNumberMaybe(el.x);
-    const z = toNumberMaybe(el.z);
-    if (x == null || z == null) return;
-    const L = toNumberMaybe(el.length) || 0;
-    const P = toNumberMaybe(el.width) || 0;
-    const x1 = projX(x - L / 2);
-    const x2 = projX(x + L / 2);
-    const y1 = projZ(z + P / 2);
-    const y2 = projZ(z - P / 2);
-    parts.push(`<rect x="${Math.min(x1, x2)}" y="${Math.min(y1, y2)}" width="${Math.abs(x2 - x1)}" height="${Math.abs(y2 - y1)}" fill="#fef9c3" stroke="#ca8a04" stroke-width="0.4" opacity="0.55"/>`);
+    const pts = orientedPolyPoints(el);
+    if (!pts) return;
+    parts.push(`<polygon points="${pts}" fill="#fef9c3" stroke="#ca8a04" stroke-width="0.4" opacity="0.55"/>`);
   });
 
   // Murs : pochage selon auto-stabilité (vert / rouge / gris si non calculé)
   state.importedElements.filter((e) => matchesCategory(e, "murs")).forEach((el) => {
-    const x = toNumberMaybe(el.x);
-    const z = toNumberMaybe(el.z);
-    if (x == null || z == null) return;
-    const L = toNumberMaybe(el.length) || 0;
-    const P = toNumberMaybe(el.width) || 0;
-    const x1 = projX(x - L / 2);
-    const x2 = projX(x + L / 2);
-    const y1 = projZ(z + P / 2);
-    const y2 = projZ(z - P / 2);
+    const pts = orientedPolyPoints(el);
+    if (!pts) return;
     const st = state.massStabilityByMur?.[el.id];
     let fill = "#cbd5e1";
     let stroke = "#475569";
     if (st?.stable === true) { fill = "#86efac"; stroke = "#15803d"; }
     else if (st?.stable === false) { fill = "#fca5a5"; stroke = "#b91c1c"; }
-    parts.push(`<rect x="${Math.min(x1, x2)}" y="${Math.min(y1, y2)}" width="${Math.abs(x2 - x1)}" height="${Math.abs(y2 - y1)}" fill="${fill}" stroke="${stroke}" stroke-width="0.9" fill-opacity="0.85"/>`);
+    parts.push(`<polygon points="${pts}" fill="${fill}" stroke="${stroke}" stroke-width="0.9" fill-opacity="0.85"/>`);
   });
 
-  // Poutres : pochage selon auto-stabilité (violet pâle / violet vif liseré)
+  // Poutres : pochage selon auto-stabilité
   state.importedElements.filter((e) => matchesCategory(e, "poutres")).forEach((el) => {
-    const x = toNumberMaybe(el.x);
-    const z = toNumberMaybe(el.z);
-    if (x == null || z == null) return;
-    const L = toNumberMaybe(el.length) || 0;
-    const P = toNumberMaybe(el.width) || 0;
-    const x1 = projX(x - L / 2);
-    const x2 = projX(x + L / 2);
-    const y1 = projZ(z + P / 2);
-    const y2 = projZ(z - P / 2);
+    const pts = orientedPolyPoints(el);
+    if (!pts) return;
     const st = state.massStabilityByPoutre?.[el.id];
     let fill = "#ede9fe";
     let stroke = "#6d28d9";
     if (st?.stable === true) { fill = "#bbf7d0"; stroke = "#15803d"; }
     else if (st?.stable === false) { fill = "#fecaca"; stroke = "#b91c1c"; }
-    parts.push(`<rect x="${Math.min(x1, x2)}" y="${Math.min(y1, y2)}" width="${Math.abs(x2 - x1)}" height="${Math.abs(y2 - y1)}" fill="${fill}" stroke="${stroke}" stroke-width="1.1" fill-opacity="0.85"/>`);
+    parts.push(`<polygon points="${pts}" fill="${fill}" stroke="${stroke}" stroke-width="1.1" fill-opacity="0.85"/>`);
   });
 
   // Positions manuelles (drag) : labelKey -> { dx, dy }
@@ -982,14 +991,18 @@ function buildEffortsTopViewSVG() {
   const drawElementLabels = ({ el, bySide, strokeColor, fillColor, textColor, kindKey }) => {
     const wx = toNumberMaybe(el.x);
     const wz = toNumberMaybe(el.z);
-    const L = toNumberMaybe(el.length) || 0;
-    const P = toNumberMaybe(el.width) || 0;
-    if (wx == null || wz == null || L <= 0) return;
-    const wallAxis = getDominantPlanAxis(el) || "X";
-    const spanWorld = wallAxis === "X" ? L : P;
-    const thickWorld = wallAxis === "X" ? P : L;
+    const spanWorld = getWallSpanLength(el) || toNumberMaybe(el.length) || 0;
+    const thickWorld = getWallThickness(el) || toNumberMaybe(el.width) || 0;
+    if (wx == null || wz == null || spanWorld <= 0) return;
+    const dirU = getElementDirU(el) || { x: 1, z: 0 };
+    const dirV = getElementDirV(el) || { x: -dirU.z, z: dirU.x };
     const arrowProjLen = spanWorld * scale;
     const hasBothSides = bySide.size > 1;
+    // Angle SVG : atan2(dZ_screen, dX) — Z descend dans le SVG
+    let angleDeg = (Math.atan2(dirU.z, dirU.x) * 180) / Math.PI;
+    // Éviter écriture à l'envers (~180°)
+    if (angleDeg > 90) angleDeg -= 180;
+    if (angleDeg < -90) angleDeg += 180;
 
     bySide.forEach((groupCases, side) => {
       groupCases.sort((a, b) => (b.effortLin - a.effortLin));
@@ -997,23 +1010,25 @@ function buildEffortsTopViewSVG() {
       if (!linCases.length) return;
 
       const perpOffsetWorld = thickWorld / 2 + 0.45;
-      let aWX, aWZ, bWX, bWZ;
-      if (wallAxis === "X") {
-        aWX = wx - spanWorld / 2;
-        bWX = wx + spanWorld / 2;
-        aWZ = bWZ = wz + side * perpOffsetWorld;
-      } else {
-        aWZ = wz - spanWorld / 2;
-        bWZ = wz + spanWorld / 2;
-        aWX = bWX = wx + side * perpOffsetWorld;
-      }
+      const aWX = wx - dirU.x * (spanWorld / 2) + dirV.x * side * perpOffsetWorld;
+      const aWZ = wz - dirU.z * (spanWorld / 2) + dirV.z * side * perpOffsetWorld;
+      const bWX = wx + dirU.x * (spanWorld / 2) + dirV.x * side * perpOffsetWorld;
+      const bWZ = wz + dirU.z * (spanWorld / 2) + dirV.z * side * perpOffsetWorld;
       const ax = projX(aWX), ay = projZ(aWZ);
       const bx = projX(bWX), by = projZ(bWZ);
       const markerRef = strokeColor === "#dc2626" ? "arr-red" : (strokeColor === "#7e22ce" ? "arr-purple" : "arr-blue");
       arrowsAndLeaders.push(`<line x1="${ax}" y1="${ay}" x2="${bx}" y2="${by}" stroke="${strokeColor}" stroke-width="1.8" marker-start="url(#${markerRef})" marker-end="url(#${markerRef})"/>`);
 
       const lines = linCases.map((c) => {
-        const v = `${formatDaN(c.effortLin)} daN/ml`;
+        const idStack =
+          kindKey === "mur" && c.murId != null && c.stack != null
+            ? `${c.murId}-${c.stack}`
+            : kindKey === "poutre" && c.poutreId != null && c.stack != null
+              ? `${c.poutreId}-${c.stack}`
+              : "";
+        const v = idStack
+          ? `${idStack} : ${formatDaN(c.effortLin)} daN/ml`
+          : `${formatDaN(c.effortLin)} daN/ml`;
         return c.anchorTxt ? `${v} – ${c.anchorTxt}` : v;
       });
       const fontSize = 8.5;
@@ -1024,7 +1039,6 @@ function buildEffortsTopViewSVG() {
       const labelW = Math.max(96, Math.round(maxLen * 4.9) + 2 * padX);
       const labelH = lines.length * lineH + 2 * padY;
 
-      // Placement par défaut : centré sur la flèche (gain de place) sauf contrainte.
       const arrowFitsLabel = arrowProjLen >= labelW + 18;
       const stackOnCenter = !hasBothSides && arrowFitsLabel;
       const midX = (ax + bx) / 2;
@@ -1032,26 +1046,31 @@ function buildEffortsTopViewSVG() {
       let defaultTx = midX, defaultTy = midY;
       if (!stackOnCenter) {
         const labelOffset = 6 + labelH / 2;
-        if (wallAxis === "X") defaultTy += side > 0 ? labelOffset : -labelOffset;
-        else defaultTx += side > 0 ? labelOffset : -labelOffset;
+        // Décalage perpendiculaire en espace écran (dirV projeté)
+        const pvx = dirV.x * scale;
+        const pvy = dirV.z * scale; // Z → Y écran (vue plongeante)
+        const plen = Math.hypot(pvx, pvy) || 1;
+        defaultTx += side * (pvx / plen) * labelOffset;
+        defaultTy += side * (pvy / plen) * labelOffset;
       }
 
-      const angle = wallAxis === "X" ? 0 : -90;
-
-      const visW = wallAxis === "X" ? labelW : labelH;
-      const visH = wallAxis === "X" ? labelH : labelW;
+      const angle = angleDeg;
+      // Bbox visuelle approx. après rotation
+      const rad = (angle * Math.PI) / 180;
+      const cA = Math.abs(Math.cos(rad));
+      const sA = Math.abs(Math.sin(rad));
+      const visW = labelW * cA + labelH * sA;
+      const visH = labelW * sA + labelH * cA;
       const padCanvas2 = 6;
       defaultTx = Math.max(visW / 2 + padCanvas2, Math.min(canvasW - visW / 2 - padCanvas2, defaultTx));
       defaultTy = Math.max(visH / 2 + padCanvas2, Math.min(canvasH - visH / 2 - padCanvas2, defaultTy));
 
-      // Application de l'éventuel offset manuel (drag-and-drop)
       const labelKey = `${kindKey}:${el.id}:${side}`;
       const manual = manualPositions[labelKey];
       const tx = defaultTx + (manual?.dx || 0);
       const ty = defaultTy + (manual?.dy || 0);
       const hasOffset = !!(manual && (Math.abs(manual.dx || 0) + Math.abs(manual.dy || 0) > 0.5));
 
-      // Ligne de rappel (visible uniquement si l'étiquette a été déplacée)
       arrowsAndLeaders.push(`<line class="leader-line" data-leader-for="${labelKey}" x1="${midX}" y1="${midY}" x2="${tx}" y2="${ty}" stroke="#6b7280" stroke-width="0.7" stroke-dasharray="4 3" opacity="${hasOffset ? 0.85 : 0}"/>`);
 
       const dataAttrs = ` data-label-key="${labelKey}" data-default-tx="${defaultTx}" data-default-ty="${defaultTy}" data-anchor-x="${midX}" data-anchor-y="${midY}" data-angle="${angle}" data-label-w="${labelW}" data-label-h="${labelH}"`;
@@ -1073,7 +1092,7 @@ function buildEffortsTopViewSVG() {
     const wx = toNumberMaybe(wallEl.x);
     const wz = toNumberMaybe(wallEl.z);
     if (wx == null || wz == null) return;
-    const wallAxis = getDominantPlanAxis(wallEl) || "X";
+    const dirV = getElementDirV(wallEl) || { x: 0, z: 1 };
 
     const firstSlab = c.slabIds
       .map((sid) => state.importedElements.find((e) => e.id === sid))
@@ -1081,13 +1100,9 @@ function buildEffortsTopViewSVG() {
 
     let side = 1;
     if (firstSlab) {
-      if (wallAxis === "X") {
-        const dz = toNumberMaybe(firstSlab.z) - wz;
-        side = dz >= 0 ? 1 : -1;
-      } else {
-        const dx = toNumberMaybe(firstSlab.x) - wx;
-        side = dx >= 0 ? 1 : -1;
-      }
+      const sx = toNumberMaybe(firstSlab.x) - wx;
+      const sz = toNumberMaybe(firstSlab.z) - wz;
+      side = (sx * dirV.x + sz * dirV.z) >= 0 ? 1 : -1;
     }
 
     let bySide = casesByMurSide.get(c.murId);
@@ -1118,8 +1133,10 @@ function buildEffortsTopViewSVG() {
         if (c.pointEffort > 0) {
           const targetX = projX(wx);
           const targetY = projZ(wz);
-          const ptVal = `${formatDaN(c.pointEffort)} daN (pointe)`;
-          const ptw = Math.max(120, ptVal.length * 5.4);
+          const ptId =
+            c.murId != null && c.stack != null ? `${c.murId}-${c.stack}` : String(wallEl.id);
+          const ptVal = `${ptId} : ${formatDaN(c.pointEffort)} daN total`;
+          const ptw = Math.max(140, ptVal.length * 5.4);
           const pth = 18;
           let defFromX = targetX + side * 70;
           let defFromY = targetY - 70 - pointIdx * 22;
@@ -1160,19 +1177,15 @@ function buildEffortsTopViewSVG() {
     const wx = toNumberMaybe(poutreEl.x);
     const wz = toNumberMaybe(poutreEl.z);
     if (wx == null || wz == null) return;
-    const wallAxis = getDominantPlanAxis(poutreEl) || "X";
+    const dirV = getElementDirV(poutreEl) || { x: 0, z: 1 };
     const firstSlab = c.slabIds
       .map((sid) => state.importedElements.find((e) => e.id === sid))
       .find((s) => s && toNumberMaybe(s.x) != null && toNumberMaybe(s.z) != null);
     let side = 1;
     if (firstSlab) {
-      if (wallAxis === "X") {
-        const dz = toNumberMaybe(firstSlab.z) - wz;
-        side = dz >= 0 ? 1 : -1;
-      } else {
-        const dx = toNumberMaybe(firstSlab.x) - wx;
-        side = dx >= 0 ? 1 : -1;
-      }
+      const sx = toNumberMaybe(firstSlab.x) - wx;
+      const sz = toNumberMaybe(firstSlab.z) - wz;
+      side = (sx * dirV.x + sz * dirV.z) >= 0 ? 1 : -1;
     }
     let bySide = casesByPoutreSide.get(c.poutreId);
     if (!bySide) { bySide = new Map(); casesByPoutreSide.set(c.poutreId, bySide); }
@@ -1307,11 +1320,18 @@ function onLabelDragMove(ev) {
   // est entre guillemets, donc les ":" du labelKey ne nécessitent pas d'escape).
   const leader = svg.querySelector(`[data-leader-for="${labelKey}"]`);
   if (leader) {
-    leader.setAttribute("x1", anchorX);
-    leader.setAttribute("y1", anchorY);
-    leader.setAttribute("x2", tx);
-    leader.setAttribute("y2", ty);
-    if (!isPoint) {
+    if (isPoint) {
+      // Flèche pointe : étiquette → faîtage (marker-end sur la pointe de pignon)
+      leader.setAttribute("x1", String(tx));
+      leader.setAttribute("y1", String(ty));
+      leader.setAttribute("x2", String(anchorX));
+      leader.setAttribute("y2", String(anchorY));
+    } else {
+      // Leader classique : ancre mur → étiquette
+      leader.setAttribute("x1", String(anchorX));
+      leader.setAttribute("y1", String(anchorY));
+      leader.setAttribute("x2", String(tx));
+      leader.setAttribute("y2", String(ty));
       leader.setAttribute("opacity", "0.85");
     }
   }
@@ -1465,7 +1485,55 @@ function getSlabTopY(slabEl) {
   return y + h / 2;
 }
 
+function getSlabBottomY(slabEl) {
+  const y = toNumberMaybe(slabEl?.y);
+  const h = toNumberMaybe(slabEl?.height) || 0;
+  if (y == null) return null;
+  return y - h / 2;
+}
+
+/**
+ * Emprise plan (XZ) d'un élément :
+ * 1) enveloppe convexe réelle (dalles/murs hors axes — alignée IFC),
+ * 2) sinon OBB dirU/dirV centré sur le centre planFrame (pas la bbox monde),
+ * 3) sinon AABB monde.
+ */
+function getElementPlanCornersXZ(el) {
+  if (Array.isArray(el?.planHullXZ) && el.planHullXZ.length >= 3) {
+    return el.planHullXZ.map((p) => ({ x: p.x, z: p.z }));
+  }
+  const x =
+    toNumberMaybe(el?.planCenterX) ??
+    toNumberMaybe(el?.x);
+  const z =
+    toNumberMaybe(el?.planCenterZ) ??
+    toNumberMaybe(el?.z);
+  if (x == null || z == null) return null;
+  const span = getWallSpanLength(el) || toNumberMaybe(el.length) || 0;
+  const thick = getWallThickness(el) || toNumberMaybe(el.width) || 0;
+  const u = getElementDirU(el);
+  const v = getElementDirV(el);
+  if (u && v && span > 0 && thick > 0) {
+    return [
+      { x: x - u.x * span / 2 - v.x * thick / 2, z: z - u.z * span / 2 - v.z * thick / 2 },
+      { x: x + u.x * span / 2 - v.x * thick / 2, z: z + u.z * span / 2 - v.z * thick / 2 },
+      { x: x + u.x * span / 2 + v.x * thick / 2, z: z + u.z * span / 2 + v.z * thick / 2 },
+      { x: x - u.x * span / 2 + v.x * thick / 2, z: z - u.z * span / 2 + v.z * thick / 2 },
+    ];
+  }
+  const L = toNumberMaybe(el.length) || 0;
+  const P = toNumberMaybe(el.width) || 0;
+  return [
+    { x: x - L / 2, z: z - P / 2 },
+    { x: x + L / 2, z: z - P / 2 },
+    { x: x + L / 2, z: z + P / 2 },
+    { x: x - L / 2, z: z + P / 2 },
+  ];
+}
+
 function getWallThickness(el) {
+  const t = toNumberMaybe(el?.thickness);
+  if (t != null && t > 0) return t;
   const a = toNumberMaybe(el?.length);
   const b = toNumberMaybe(el?.width);
   if (a == null && b == null) return null;
@@ -1475,12 +1543,45 @@ function getWallThickness(el) {
 }
 
 function getWallSpanLength(el) {
+  const s = toNumberMaybe(el?.span);
+  if (s != null && s > 0) return s;
   const a = toNumberMaybe(el?.length);
   const b = toNumberMaybe(el?.width);
   if (a == null && b == null) return null;
   if (a == null) return b;
   if (b == null) return a;
   return Math.max(a, b);
+}
+
+/** Direction unitaire horizontale de l'axe long du mur (XZ monde). */
+function getElementDirU(el) {
+  const d = el?.dirU;
+  if (d && Number.isFinite(d.x) && Number.isFinite(d.z)) {
+    const len = Math.hypot(d.x, d.z);
+    if (len > 1e-9) return { x: d.x / len, z: d.z / len };
+  }
+  const axis = getDominantPlanAxisFromAabb(el);
+  if (axis === "X") return { x: 1, z: 0 };
+  if (axis === "Z") return { x: 0, z: 1 };
+  return null;
+}
+
+function getElementDirV(el) {
+  const d = el?.dirV;
+  if (d && Number.isFinite(d.x) && Number.isFinite(d.z)) {
+    const len = Math.hypot(d.x, d.z);
+    if (len > 1e-9) return { x: d.x / len, z: d.z / len };
+  }
+  const u = getElementDirU(el);
+  if (!u) return null;
+  return { x: -u.z, z: u.x };
+}
+
+function getDominantPlanAxisFromAabb(el) {
+  const lx = Math.abs(toNumberMaybe(el?.length) || 0);
+  const lz = Math.abs(toNumberMaybe(el?.width) || 0);
+  if (lx === 0 && lz === 0) return null;
+  return lx >= lz ? "X" : "Z";
 }
 
 function computeWallHeightForMass(araseHeight, slabY) {
@@ -1522,6 +1623,42 @@ function getWallStackCentralSlabY(slabIds) {
   if (!ys.length) return null;
   return Math.max(...ys);
 }
+
+/**
+ * Interface haute de la dalle la plus haute associée au mur (murToSlabs),
+ * sinon fallback sur les dalles du stack courant.
+ */
+function getWallMaxAssociatedSlabTopY(murEl, slabIdsFallback) {
+  const murId = murEl?.id;
+  const fromWall = Array.isArray(state.murToSlabs?.[murId])
+    ? state.murToSlabs[murId]
+    : [];
+  const ids = fromWall.length ? fromWall : slabIdsFallback || [];
+  return getWallStackCentralSlabY(ids);
+}
+
+/**
+ * Pente de pignon (%) depuis le profil haut du mur :
+ * pente = (ypointe − ybas) / (Lmur/2) × 100.
+ * @returns {number|null}
+ */
+function getWallPignonPentePct(murEl) {
+  const yPeak = getWallPignonPointeWorldY(murEl);
+  const yBas = getWallPignonBasWorldY(murEl);
+  const L = getWallSpanLength(murEl) || 0;
+  if (yPeak == null || yBas == null || !(L > 0.05)) return null;
+  const rise = yPeak - yBas;
+  if (!(rise > 0.02)) return null;
+  const halfSpan = L / 2;
+  const pente = (rise / halfSpan) * 100;
+  return Number.isFinite(pente) && pente > 0 ? pente : null;
+}
+
+/**
+ * Hauteur équivalente Excel pointe : Ht/3×2 = 2/3 × Ht.
+ * Formule totale : (2Ht/3)/(pente/100) × (2Ht/3) × G_mur × Sd/g
+ */
+const PIGNON_POINTE_H_EQ_FACTOR = 2 / 3;
 
 function parseUserRefHeightM(userStr) {
   const v = toNumberMaybe(String(userStr ?? "").replace(",", "."));
@@ -1575,9 +1712,16 @@ function resolveWallRefWorldY(refKey, userMStr, murEl, araseIndex, slabIdsInCase
     return null;
   }
   if (kind === WALL_REF_PIGNON_POINTE) return getWallPignonPointeWorldY(murEl);
-  if (kind === WALL_REF_PIGNON_BAS) return getWallAraseWorldY(murEl, araseIndex);
+  if (kind === WALL_REF_PIGNON_BAS) {
+    return getWallPignonBasWorldY(murEl) ?? getWallAraseWorldY(murEl, araseIndex);
+  }
   if (kind === WALL_REF_PIED) return getWallBaseWorldY(murEl);
-  if (kind === WALL_REF_ARASE) return getWallAraseWorldY(murEl, araseIndex);
+  if (kind === WALL_REF_ARASE) {
+    // Tête libre = arase/segment le plus haut du mur
+    const n = Array.isArray(murEl?.araseHeights) ? murEl.araseHeights.length : 1;
+    const topIdx = Math.max(0, (n || 1) - 1);
+    return getWallAraseWorldY(murEl, topIdx);
+  }
   if (kind === WALL_REF_SLAB_MAX) {
     const ys = (slabIdsInCase || [])
       .map((sid) => {
@@ -1606,38 +1750,176 @@ function resolveWallRefWorldY(refKey, userMStr, murEl, araseIndex, slabIdsInCase
 }
 
 /**
- * Détail masse mur/stack : hauteur équivalente, cas pignon pointe–pointe, dalle rampante (niveau central = ref. haute résolue).
- * @returns {{ hMur: number|null, mMurLinear: number|null, skipSlabs: boolean, effortPointeDaN: number|null, ATriM2: number|null}|null}
+ * Détail masse mur/stack : hauteur équivalente, cas pignon pointe–pointe, dalle rampante,
+ * ou réf. haute utilisateur (hMur = Lh/2).
+ * @returns {{
+ *   hMur: number|null,
+ *   mMurLinear: number|null,
+ *   skipSlabs: boolean,
+ *   effortPointeDaN: number|null,
+ *   ATriM2: number|null,
+ *   userMode?: boolean,
+ *   Lh?: number|null,
+ *   hCalcNote?: string|null,
+ *   softWarning?: string|null,
+ *   hLimitM?: number|null,
+ * }|null}
  */
+function getWallTopAraseIndex(murEl) {
+  const n = Array.isArray(murEl?.araseHeights) ? murEl.araseHeights.length : 0;
+  return Math.max(0, n - 1);
+}
+
+/** Hauteur mur disponible au-dessus de la réf. basse (jusqu’à arase / pointe). */
+function getWallHeightAboveBasseM(murEl, araseIndex, slabIds, sr) {
+  const topIdx = Number.isFinite(araseIndex) ? araseIndex : getWallTopAraseIndex(murEl);
+  const yB = resolveWallRefWorldY(sr.refBasse, sr.userBasse, murEl, topIdx, slabIds || []);
+  if (yB == null) return null;
+  const yPeak = getWallPignonPointeWorldY(murEl);
+  const yArase = getWallAraseWorldY(murEl, topIdx);
+  const yTop = Math.max(
+    Number.isFinite(yPeak) ? yPeak : -Infinity,
+    Number.isFinite(yArase) ? yArase : -Infinity
+  );
+  if (!Number.isFinite(yTop)) return null;
+  const h = yTop - yB;
+  return h > 0 ? h : 0;
+}
+
 function computeWallStackMurMassDetail(murEl, araseIndex, slabIds, sr) {
   if (!sr) return null;
-  const yC0 = getWallStackCentralSlabY(slabIds);
-  const yWallTop = getWallAraseWorldY(murEl, araseIndex);
-  if (yC0 == null || yWallTop == null) return null;
+  const topIdx = Number.isFinite(araseIndex) ? araseIndex : getWallTopAraseIndex(murEl);
+  let yC0 = getWallStackCentralSlabY(slabIds);
+  const yWallTop = getWallAraseWorldY(murEl, topIdx);
+  if (yC0 == null) {
+    const yB = resolveWallRefWorldY(sr.refBasse, sr.userBasse, murEl, topIdx, slabIds || []);
+    const yH = resolveWallRefWorldY(sr.refHaute, sr.userHaute, murEl, topIdx, slabIds || []);
+    if (yB != null && yH != null) yC0 = (yB + yH) / 2;
+    else yC0 = yB ?? yH ?? getWallBaseWorldY(murEl);
+  }
 
   const hKey = String(sr.refHaute || "").trim();
   const bKey = String(sr.refBasse || "").trim();
 
+  // 1) Pointe / Pointe (formule Excel) :
+  //    Ht = ypointe − ydalle_max (mur)
+  //    h_eq = Ht/3×2 = 2/3·Ht
+  //    A = (h_eq /(pente/100)) × h_eq   [= triangle demi-base×hauteur]
+  //    G_mur = ρ·t
+  //    effort total (masse) = A·G_mur  → × Sd/g en rendu
+  //    effort linéique (masse) = G_mur·h_eq
   if (hKey === WALL_REF_PIGNON_POINTE && bKey === WALL_REF_PIGNON_POINTE) {
     const yPeak = getWallPignonPointeWorldY(murEl);
     if (yPeak == null) return null;
-    const H = Math.max(0, yPeak - yC0);
-    const Lspan = getWallSpanLength(murEl) || 0;
-    const ATri = 0.5 * Lspan * H;
+    const yDalleMax = getWallMaxAssociatedSlabTopY(murEl, slabIds);
+    if (yDalleMax == null) {
+      return {
+        hMur: null,
+        mMurLinear: null,
+        skipSlabs: true,
+        effortPointeDaN: null,
+        ATriM2: null,
+        pentePct: null,
+        userMode: false,
+        hCalcNote: "Pointe/Pointe : aucune dalle associée au mur pour caler Ht",
+        softWarning:
+          "Pointe/Pointe : associe au moins une dalle au mur (niveau de référence manquant).",
+        hLimitM: null,
+      };
+    }
+    const Ht = Math.max(0, yPeak - yDalleMax);
+    const hEq = PIGNON_POINTE_H_EQ_FACTOR * Ht;
+    const pentePct = getWallPignonPentePct(murEl);
     const densKey = state.mursAttributes?.[murEl.id]?.typeMurKey || "";
     const dens = densKey ? getMaterialValue(densKey) : 0;
     const t = getWallThickness(murEl) || 0;
-    const effortPointeDaN = 0.65 * ATri * dens * t;
-    const mMurLinear = Lspan > 0 ? effortPointeDaN / Lspan : 0;
-    const hMur = dens > 0 && t > 0 ? mMurLinear / (dens * t) : null;
-    return { hMur, mMurLinear, skipSlabs: true, effortPointeDaN, ATriM2: ATri };
+    const Gmur = dens * t; // daN/m²
+    const Lspan = getWallSpanLength(murEl) || 0;
+
+    if (pentePct == null || pentePct <= 0) {
+      return {
+        hMur: hEq,
+        mMurLinear: Gmur * hEq,
+        skipSlabs: true,
+        effortPointeDaN: null,
+        ATriM2: null,
+        pentePct: null,
+        userMode: false,
+        hCalcNote: `Pointe/Pointe : Ht=${formatNum(Ht)} m → h_eq=2/3·Ht=${formatNum(hEq)} m (pente Indispo.)`,
+        softWarning: "Pointe/Pointe : pente de pignon non mesurable sur le modèle.",
+        hLimitM: null,
+      };
+    }
+
+    // (Ht/3*2/(Pente/100)) * (Ht/3*2) * G_mur
+    const halfBaseEq = hEq / (pentePct / 100);
+    const ATri = halfBaseEq * hEq;
+    const mMurLinear = Gmur * hEq;
+    const effortPointeDaN = ATri * Gmur;
+    return {
+      hMur: hEq,
+      mMurLinear,
+      skipSlabs: true,
+      effortPointeDaN,
+      ATriM2: ATri,
+      pentePct,
+      HtPointe: Ht,
+      userMode: false,
+      hCalcNote:
+        `Pointe/Pointe Excel : Ht=${formatNum(Ht)} m, pente=${formatNum(pentePct)} %` +
+        ` → h_eq=2/3·Ht=${formatNum(hEq)} m, A=${formatNum(ATri)} m²` +
+        ` → m_lin=${formatNum(mMurLinear)} daN/ml, m_tot=${formatNum(effortPointeDaN)} daN`,
+      softWarning: null,
+      hLimitM: null,
+    };
   }
+
+  // 2) Réf. haute = utilisateur : hcalc = Lh / 2 (masse dalle inchangée si cochée)
+  if (hKey === WALL_REF_USER) {
+    const Lh = parseUserRefHeightM(sr.userHaute);
+    if (Lh == null) {
+      return {
+        hMur: null,
+        mMurLinear: null,
+        skipSlabs: false,
+        effortPointeDaN: null,
+        ATriM2: null,
+        userMode: true,
+        Lh: null,
+        hCalcNote: "Réf. haute utilisateur : saisir Lh (m)",
+        softWarning: "Hauteur utilisateur manquante ou invalide.",
+        hLimitM: null,
+      };
+    }
+    const hMur = Lh / 2;
+    const hLimit = getWallHeightAboveBasseM(murEl, topIdx, slabIds, sr);
+    let softWarning = null;
+    if (hLimit != null && Lh > hLimit + 0.001) {
+      softWarning =
+        `Lh = ${formatNum(Lh)} m dépasse la hauteur mur au-dessus de la réf. basse ` +
+        `(limite ≈ ${formatNum(hLimit)} m). Calcul non bloqué.`;
+    }
+    return {
+      hMur,
+      mMurLinear: null,
+      skipSlabs: false,
+      effortPointeDaN: null,
+      ATriM2: null,
+      userMode: true,
+      Lh,
+      hCalcNote: `hcalc = Lh/2 = ${formatNum(hMur)} m (Lh = ${formatNum(Lh)} m)`,
+      softWarning,
+      hLimitM: hLimit,
+    };
+  }
+
+  if (yC0 == null || yWallTop == null) return null;
 
   let yC = yC0;
   const wallKind = classifyWallRoofFromProfiles(murEl).kind;
-  const yRefHaute = resolveWallRefWorldY(sr.refHaute, sr.userHaute, murEl, araseIndex, slabIds);
+  const yRefHaute = resolveWallRefWorldY(sr.refHaute, sr.userHaute, murEl, topIdx, slabIds);
   if (
-    wallKind === "Pignon" &&
+    (wallKind === "Pignon" || wallKind === "Rampant") &&
     (stackHasRampantPignonSlab(murEl, slabIds) ||
       hKey === WALL_REF_PIGNON_BAS ||
       hKey === WALL_REF_PIGNON_POINTE)
@@ -1645,13 +1927,10 @@ function computeWallStackMurMassDetail(murEl, araseIndex, slabIds, sr) {
     if (yRefHaute != null) yC = yRefHaute;
   }
 
-  const basParsed = parseWallRefKey(sr.refBasse);
+  // Réf. basse = toujours géométrique (plus d’option utilisateur)
   let below = 0;
-  if (basParsed.kind === WALL_REF_USER) {
-    const L = parseUserRefHeightM(sr.userBasse);
-    if (L != null) below = L / 2;
-  } else {
-    const yB = resolveWallRefWorldY(sr.refBasse, sr.userBasse, murEl, araseIndex, slabIds);
+  {
+    const yB = resolveWallRefWorldY(sr.refBasse, sr.userBasse, murEl, topIdx, slabIds);
     const yPeak = getWallPignonPointeWorldY(murEl);
     if (yB != null && yPeak != null && yB >= yPeak - 0.02) {
       below = 0;
@@ -1668,15 +1947,23 @@ function computeWallStackMurMassDetail(murEl, araseIndex, slabIds, sr) {
   } else if (hKey === WALL_REF_PIGNON_POINTE) {
     const yPeak = getWallPignonPointeWorldY(murEl);
     if (yPeak != null && yPeak > yC) above = (yPeak - yC) / 3;
-  } else if (parseWallRefKey(sr.refHaute).kind === WALL_REF_USER) {
-    const L = parseUserRefHeightM(sr.userHaute);
-    if (L != null) above = L / 2;
   } else {
-    const yH = resolveWallRefWorldY(sr.refHaute, sr.userHaute, murEl, araseIndex, slabIds);
+    const yH = resolveWallRefWorldY(sr.refHaute, sr.userHaute, murEl, topIdx, slabIds);
     if (yH != null && yH > yC) above = (yH - yC) / 2;
   }
 
-  return { hMur: below + above, mMurLinear: null, skipSlabs: false, effortPointeDaN: null, ATriM2: null };
+  const hMur = below + above;
+  return {
+    hMur,
+    mMurLinear: null,
+    skipSlabs: false,
+    effortPointeDaN: null,
+    ATriM2: null,
+    userMode: false,
+    hCalcNote: `hcalc = hbas + hhaut = ${formatNum(hMur)} m`,
+    softWarning: null,
+    hLimitM: null,
+  };
 }
 
 function computeWallStackMurHeightFromRefs(murEl, araseIndex, slabIds, sr) {
@@ -1693,6 +1980,133 @@ function getDefaultWallStackRefs() {
   };
 }
 
+const WALL_CALC_STACK_MAX = 10;
+
+function formatWallRefLabel(refKey, userVal) {
+  const k = String(refKey || "").trim();
+  if (!k) return "—";
+  if (k === WALL_REF_ARASE) return "Arase (tête libre)";
+  if (k === WALL_REF_PIED) return "Pied de mur";
+  if (k === WALL_REF_SLAB_MAX) return "Dalle la plus haute";
+  if (k === WALL_REF_SLAB_MIN) return "Dalle la plus basse";
+  if (k === WALL_REF_PIGNON_POINTE) return "Pointe de pignon";
+  if (k === WALL_REF_PIGNON_BAS) return "Bas de pente";
+  if (k === WALL_REF_USER) {
+    const u = String(userVal || "").trim();
+    return u
+      ? `Utilisateur Lh=${u} m → hcalc=Lh/2`
+      : "Donnée utilisateur (Lh → hcalc=Lh/2)";
+  }
+  if (k.startsWith(WALL_REF_SLAB_PREFIX)) return `Dalle n° ${k.slice(WALL_REF_SLAB_PREFIX.length)}`;
+  return k;
+}
+
+function createEmptyWallCalcStack(availableSlabIds, checkAll = true) {
+  const slabs = {};
+  (availableSlabIds || []).forEach((sid) => {
+    slabs[sid] = !!checkAll;
+  });
+  return { ...getDefaultWallStackRefs(), slabs };
+}
+
+function migrateWallAraseConfigToCalc(murId, availableSlabIds) {
+  if (!state.wallCalcConfig) state.wallCalcConfig = { murs: {} };
+  if (state.wallCalcConfig.murs[murId]) return state.wallCalcConfig.murs[murId];
+
+  const stacks = [];
+  const oldArr = state.wallAraseConfig?.murs?.[murId];
+  if (Array.isArray(oldArr)) {
+    for (const araseCfg of oldArr) {
+      if (!araseCfg?.enabled) continue;
+      ensureWallStackRefs(araseCfg);
+      for (let si = 1; si <= 3; si++) {
+        const slabMap = {};
+        let any = false;
+        for (const [sidStr, info] of Object.entries(araseCfg.slabs || {})) {
+          const sid = Number(sidStr);
+          if (!Number.isFinite(sid) || !info?.enabled) continue;
+          if (info.stacks?.[si - 1]) {
+            slabMap[sid] = info.takeMass !== false;
+            any = true;
+          }
+        }
+        if (!any) continue;
+        const sr = araseCfg.stackRefs?.[si] || getDefaultWallStackRefs();
+        // Compléter les dalles disponibles (décochées si absentes)
+        (availableSlabIds || []).forEach((sid) => {
+          if (slabMap[sid] === undefined) slabMap[sid] = false;
+        });
+        stacks.push({
+          refHaute: sr.refHaute,
+          refBasse: sr.refBasse,
+          userHaute: sr.userHaute || "",
+          userBasse: sr.userBasse || "",
+          slabs: slabMap,
+        });
+        if (stacks.length >= WALL_CALC_STACK_MAX) break;
+      }
+      if (stacks.length >= WALL_CALC_STACK_MAX) break;
+    }
+  }
+
+  const cfg = {
+    stackCount: stacks.length,
+    stacks,
+  };
+  state.wallCalcConfig.murs[murId] = cfg;
+  return cfg;
+}
+
+function ensureWallCalcConfig(murId, availableSlabIds) {
+  if (!state.wallCalcConfig) state.wallCalcConfig = { murs: {} };
+  let cfg = state.wallCalcConfig.murs[murId];
+  if (!cfg) {
+    cfg = migrateWallAraseConfigToCalc(murId, availableSlabIds);
+  }
+  if (!Array.isArray(cfg.stacks)) cfg.stacks = [];
+  let n = Number(cfg.stackCount);
+  if (!Number.isFinite(n) || n < 0) n = cfg.stacks.length || 0;
+  n = Math.max(0, Math.min(WALL_CALC_STACK_MAX, Math.floor(n)));
+  cfg.stackCount = n;
+  while (cfg.stacks.length < n) {
+    cfg.stacks.push(createEmptyWallCalcStack(availableSlabIds, true));
+  }
+  if (cfg.stacks.length > n) cfg.stacks.length = n;
+  cfg.stacks.forEach((st) => {
+    if (!st.slabs || typeof st.slabs !== "object") st.slabs = {};
+    (availableSlabIds || []).forEach((sid) => {
+      if (st.slabs[sid] === undefined) st.slabs[sid] = true;
+    });
+    if (!st.refHaute) st.refHaute = WALL_REF_ARASE;
+    if (!st.refBasse) st.refBasse = WALL_REF_PIED;
+    // Réf. basse utilisateur retirée : bascule vers pied de mur
+    if (String(st.refBasse || "").trim() === WALL_REF_USER) {
+      st.refBasse = WALL_REF_PIED;
+      st.userBasse = "";
+    }
+    if (st.userHaute == null) st.userHaute = "";
+    if (st.userBasse == null) st.userBasse = "";
+  });
+  state.wallCalcConfig.murs[murId] = cfg;
+  return cfg;
+}
+
+function recomputeWallMaskFromCalcConfig(murId) {
+  const cfg = state.wallCalcConfig?.murs?.[murId];
+  const set = new Set();
+  if (cfg?.stacks) {
+    cfg.stacks.forEach((st) => {
+      Object.entries(st.slabs || {}).forEach(([sidStr, on]) => {
+        if (!on) return;
+        const sid = Number(sidStr);
+        if (Number.isFinite(sid)) set.add(sid);
+      });
+    });
+  }
+  if (!state.associationMask.murs) state.associationMask.murs = {};
+  state.associationMask.murs[murId] = set;
+}
+
 function ensureWallStackRefs(cfg) {
   if (!cfg.stackRefs || typeof cfg.stackRefs !== "object") {
     cfg.stackRefs = {};
@@ -1706,6 +2120,10 @@ function ensureWallStackRefs(cfg) {
       cfg.stackRefs[si].refBasse = cfg.stackRefs[si].refBasse ?? d.refBasse;
       cfg.stackRefs[si].userHaute = cfg.stackRefs[si].userHaute ?? "";
       cfg.stackRefs[si].userBasse = cfg.stackRefs[si].userBasse ?? "";
+      if (String(cfg.stackRefs[si].refBasse || "").trim() === WALL_REF_USER) {
+        cfg.stackRefs[si].refBasse = WALL_REF_PIED;
+        cfg.stackRefs[si].userBasse = "";
+      }
       // Ancien défaut (haut = dalle max, bas = pied) → nouveau modèle « arase en tête » pleine au-dessus de la dalle
       if (cfg.stackRefs[si].refHaute === WALL_REF_SLAB_MAX && cfg.stackRefs[si].refBasse === WALL_REF_PIED) {
         cfg.stackRefs[si].refHaute = WALL_REF_ARASE;
@@ -1761,16 +2179,19 @@ function renderWallAraseStackRefSection(murId, araseIndex, cfg, slabIds, araseBo
   title.style.marginBottom = "0.25rem";
   wrap.appendChild(title);
 
-  const refOptions = () => {
-    if (murRoofKind === "Pignon") {
+  const isPignonOrRampant = murRoofKind === "Pignon" || murRoofKind === "Rampant";
+  const refOptions = (includeUser) => {
+    if (isPignonOrRampant) {
       const opts = [
         { v: WALL_REF_PIGNON_POINTE, label: "Pointe de pignon" },
-        { v: WALL_REF_PIGNON_BAS, label: "Bas de pignon" },
+        { v: WALL_REF_PIGNON_BAS, label: "Bas de pente" },
         { v: WALL_REF_PIED, label: "Pied de mur" },
         { v: WALL_REF_SLAB_MAX, label: "Dalle la plus haute (stack)" },
         { v: WALL_REF_SLAB_MIN, label: "Dalle la plus basse (stack)" },
-        { v: WALL_REF_USER, label: "Donnée utilisateur" },
       ];
+      if (includeUser) {
+        opts.push({ v: WALL_REF_USER, label: "Donnée utilisateur (Lh → hcalc=Lh/2)" });
+      }
       slabIds.forEach((sid) => {
         opts.push({ v: `${WALL_REF_SLAB_PREFIX}${sid}`, label: `Dalle n° ${sid}` });
       });
@@ -1781,15 +2202,17 @@ function renderWallAraseStackRefSection(murId, araseIndex, cfg, slabIds, araseBo
       { v: WALL_REF_PIED, label: "Pied de mur" },
       { v: WALL_REF_SLAB_MAX, label: "Dalle la plus haute (stack)" },
       { v: WALL_REF_SLAB_MIN, label: "Dalle la plus basse (stack)" },
-      { v: WALL_REF_USER, label: "Donnée utilisateur" },
     ];
+    if (includeUser) {
+      opts.push({ v: WALL_REF_USER, label: "Donnée utilisateur (Lh → hcalc=Lh/2)" });
+    }
     slabIds.forEach((sid) => {
       opts.push({ v: `${WALL_REF_SLAB_PREFIX}${sid}`, label: `Dalle n° ${sid}` });
     });
     return opts;
   };
 
-  if (murRoofKind === "Pignon") {
+  if (isPignonOrRampant) {
     for (let si = 1; si <= 3; si++) {
       const sr0 = cfg.stackRefs[si];
       if (sr0.refHaute === WALL_REF_ARASE) sr0.refHaute = WALL_REF_PIGNON_POINTE;
@@ -1801,6 +2224,11 @@ function renderWallAraseStackRefSection(murId, araseIndex, cfg, slabIds, araseBo
     const sr = cfg.stackRefs[stackNum];
     const userKey = field === "refHaute" ? "userHaute" : "userBasse";
     const curKey = field === "refHaute" ? "refHaute" : "refBasse";
+    const includeUser = field === "refHaute";
+    if (!includeUser && String(sr[curKey] || "").trim() === WALL_REF_USER) {
+      sr[curKey] = WALL_REF_PIED;
+      sr[userKey] = "";
+    }
 
     const wrapRow = document.createElement("div");
     wrapRow.style.marginBottom = "0.18rem";
@@ -1822,7 +2250,7 @@ function renderWallAraseStackRefSection(murId, araseIndex, cfg, slabIds, araseBo
     sel.style.maxWidth = "100%";
     const cur = sr[curKey];
     let matched = false;
-    refOptions().forEach((o) => {
+    refOptions(includeUser).forEach((o) => {
       const op = document.createElement("option");
       op.value = o.v;
       op.textContent = o.label;
@@ -1846,10 +2274,10 @@ function renderWallAraseStackRefSection(murId, araseIndex, cfg, slabIds, araseBo
     row.appendChild(sel);
     wrapRow.appendChild(row);
 
-    if (parseWallRefKey(sr[curKey]).kind === WALL_REF_USER) {
+    if (includeUser && parseWallRefKey(sr[curKey]).kind === WALL_REF_USER) {
       const inp = document.createElement("input");
       inp.type = "text";
-      inp.placeholder = "Hauteur [m] (÷2 pour masse)";
+      inp.placeholder = "Hauteur relative Lh [m] → hcalc = Lh/2";
       inp.value = sr[userKey] ?? "";
       inp.style.width = "100%";
       inp.style.fontSize = "0.66rem";
@@ -1950,6 +2378,8 @@ function computeAnchorageNeed(murEl, murId, effortTete, stab, opts = {}) {
 }
 
 function getBeamSpanLength(el) {
+  const s = toNumberMaybe(el?.span);
+  if (s != null && s > 0) return s;
   const L = toNumberMaybe(el?.length);
   const P = toNumberMaybe(el?.width);
   if (L == null && P == null) return null;
@@ -1959,14 +2389,15 @@ function getBeamSpanLength(el) {
 }
 
 function getBeamSectionDims(el) {
-  const L = toNumberMaybe(el?.length);
-  const P = toNumberMaybe(el?.width);
   const H = toNumberMaybe(el?.height);
-  if (H == null || (L == null && P == null)) return null;
   const span = getBeamSpanLength(el);
-  let thickness = null;
-  if (L != null && P != null) thickness = Math.min(L, P);
-  else thickness = L != null ? L : P;
+  const thickness = toNumberMaybe(el?.thickness) ?? (() => {
+    const L = toNumberMaybe(el?.length);
+    const P = toNumberMaybe(el?.width);
+    if (L != null && P != null) return Math.min(L, P);
+    return L != null ? L : P;
+  })();
+  if (H == null || span == null || thickness == null) return null;
   return { height: H, thickness, span };
 }
 
@@ -2043,16 +2474,28 @@ function computeBeamChainageAnchorageNeed(typeStructKey, Lfull, effortTete, stab
   return { label: `>${MAX_N - 1}`, anchors: null };
 }
 
+/**
+ * Axe dominant "canonique" pour compatibilité code historique.
+ * Si le mur a un dirU local : renvoie "X" si |ux|≥|uz|, sinon "Z"
+ * (approximation pour code qui attend encore X/Z).
+ * Préférer getElementDirU / profiles locaux pour la géométrie réelle.
+ */
 function getDominantPlanAxis(el) {
-  const lx = Math.abs(toNumberMaybe(el?.length) || 0);
-  const lz = Math.abs(toNumberMaybe(el?.width) || 0);
-  if (lx === 0 && lz === 0) return null;
-  return lx >= lz ? "X" : "Z";
+  const u = el?.dirU;
+  if (u && Number.isFinite(u.x) && Number.isFinite(u.z)) {
+    return Math.abs(u.x) >= Math.abs(u.z) ? "X" : "Z";
+  }
+  return getDominantPlanAxisFromAabb(el);
 }
 
-/** Sens porteur affiché : X (monde X) ou Y (monde Z en plan). Compat. L/P. */
+/**
+ * Sens porteur : "X" | "Y" | "edge:N" | compat L/P.
+ * Retourne une clé normalisée ou "".
+ */
 function normalizeCharpenteSens(slabEl, sens) {
-  const s = String(sens || "").trim().toUpperCase();
+  const raw = String(sens || "").trim();
+  if (/^edge:\d+$/i.test(raw)) return raw.toLowerCase();
+  const s = raw.toUpperCase();
   if (s === "X") return "X";
   if (s === "Y" || s === "Z") return "Y";
   if (s === "L" || s === "P") {
@@ -2069,15 +2512,71 @@ function getBearingPlanAxisFromSens(slabEl, sens) {
   const n = normalizeCharpenteSens(slabEl, sens);
   if (n === "X") return "X";
   if (n === "Y") return "Z";
+  // edge:N → pas un axe monde canonique
   return null;
 }
 
+/** Liste des sens ⊥ bords du contour (2+ pour rectangle, 3 pour triangle/trapèze…). */
+function getSlabEdgeDirs(slabEl) {
+  if (Array.isArray(slabEl?.edgeDirs) && slabEl.edgeDirs.length >= 1) return slabEl.edgeDirs;
+  const u = getElementDirU(slabEl);
+  const v = getElementDirV(slabEl);
+  if (!u || !v) return [];
+  const ang = (ax, az) => Math.round(planAngleDeg180(ax, az));
+  return [
+    { edge: u, perp: v, angleDeg: ang(u.x, u.z), label: `⊥ bord ${ang(u.x, u.z)}°` },
+    { edge: v, perp: u, angleDeg: ang(v.x, v.z), label: `⊥ bord ${ang(v.x, v.z)}°` },
+  ];
+}
+
+/**
+ * Direction unitaire XZ du sens porteur (portée de la dalle).
+ * Pour edge:N = perpendiculaire au bord N.
+ */
+function getSlabBearingDirUnitXZ(slabEl, sens) {
+  const n = normalizeCharpenteSens(slabEl, sens);
+  if (n === "X") return new THREE.Vector3(1, 0, 0);
+  if (n === "Y") return new THREE.Vector3(0, 0, 1);
+  const m = /^edge:(\d+)$/i.exec(n);
+  if (m) {
+    const idx = Number(m[1]);
+    const ed = getSlabEdgeDirs(slabEl)[idx];
+    if (ed?.perp) {
+      const len = Math.hypot(ed.perp.x, ed.perp.z);
+      if (len > 1e-9) return new THREE.Vector3(ed.perp.x / len, 0, ed.perp.z / len);
+    }
+  }
+  return null;
+}
+
+/**
+ * Portée de la dalle selon l'axe porteur : étendue projetée sur cet axe.
+ * Préfère span/thickness locaux si l'axe est aligné avec dirU/dirV.
+ */
 function getSlabBearingSpanM(slabEl, sens) {
+  const dir = getSlabBearingDirUnitXZ(slabEl, sens);
+  if (dir && slabEl?.dirU && Number.isFinite(slabEl.span) && Number.isFinite(slabEl.thickness)) {
+    const u = getElementDirU(slabEl);
+    const v = getElementDirV(slabEl);
+    if (u && v) {
+      const du = Math.abs(dir.x * u.x + dir.z * u.z);
+      const dv = Math.abs(dir.x * v.x + dir.z * v.z);
+      // Si porteur ≈ dirU → span ; si ≈ dirV → thickness
+      if (du >= 0.7) return slabEl.span;
+      if (dv >= 0.7) return slabEl.thickness;
+      // sinon : combinaison (emprise projetée approx.)
+      return Math.abs(slabEl.span * (dir.x * u.x + dir.z * u.z))
+        + Math.abs(slabEl.thickness * (dir.x * v.x + dir.z * v.z));
+    }
+  }
   const lx = Math.abs(toNumberMaybe(slabEl?.length) || 0);
   const lz = Math.abs(toNumberMaybe(slabEl?.width) || 0);
   const bearing = getBearingPlanAxisFromSens(slabEl, sens);
   if (bearing === "X") return lx;
   if (bearing === "Z") return lz;
+  if (Number.isFinite(slabEl?.span) && Number.isFinite(slabEl?.thickness)) {
+    return Math.max(slabEl.span, slabEl.thickness);
+  }
   return Math.max(lx, lz);
 }
 
@@ -2085,18 +2584,50 @@ function getSlabDemiPorteeM(slabEl, sens) {
   return getSlabBearingSpanM(slabEl, sens) / 2;
 }
 
-function getSlabBearingDirUnitXZ(slabEl, sens) {
-  const bearing = getBearingPlanAxisFromSens(slabEl, sens);
-  if (bearing === "X") return new THREE.Vector3(1, 0, 0);
-  if (bearing === "Z") return new THREE.Vector3(0, 0, 1);
-  return null;
+/**
+ * Mini de charge charpente (m) si le mur/poutre n’est pas (assez) porteur.
+ * Même règle historique : non-porteur ≠ 0, on garde 1 m mini.
+ */
+const CHARPENTE_DEMI_PORTEE_MIN_M = 1.0;
+
+/**
+ * |sin φ| entre l’axe long du porteur (mur/poutre) et le sens porteur dalle.
+ * 1 = sens ⊥ au mur (plein apport) ; 0 = parallèle (non porteur) ; ≈0,707 à 45°.
+ */
+function getCarrierSlabBearingSinFactor(carrierEl, slabEl, sens) {
+  const wallDir = getElementDirU(carrierEl);
+  const bearingDir = getSlabBearingDirUnitXZ(slabEl, sens);
+  if (wallDir && bearingDir) {
+    const cos = Math.abs(wallDir.x * bearingDir.x + wallDir.z * bearingDir.z);
+    const sin = Math.sqrt(Math.max(0, 1 - Math.min(1, cos * cos)));
+    return sin;
+  }
+  // Fallback axes monde : porteur si axes différents → sin≈1, sinon 0
+  const wallAxis = getDominantPlanAxis(carrierEl);
+  const bearingAxis = getBearingPlanAxisFromSens(slabEl, sens);
+  if (!wallAxis || !bearingAxis) return 1;
+  return bearingAxis !== wallAxis ? 1 : 0;
 }
 
+/**
+ * Demi-portée retenue pour la masse charpente sur un mur/poutre :
+ * - sens oblique (ex. 45°) : demiPortee × |sin φ| (projection sur la normale au mur)
+ * - quasi parallèle / non porteur (|sin φ| < 0,5) : 1 m mini
+ */
+function getCarrierSlabDemiPorteeM(carrierEl, slabEl, sens) {
+  const base = getSlabDemiPorteeM(slabEl, sens) || 0;
+  const sinF = getCarrierSlabBearingSinFactor(carrierEl, slabEl, sens);
+  // Seuil ~30° autour de la perpendiculaire (|sin|≥0,5 ⇔ angle mur/portant ≥ 30° depuis //… wait)
+  // |sin φ| où φ = angle entre axe mur et sens porteur :
+  //   φ=90° (⊥) → sin=1 ; φ=45° → 0.707 ; φ=0° (//) → 0
+  // |sin| ≥ 0.5 ⇔ φ ∈ [30°, 150°] ≈ assez porteur pour projeter
+  if (sinF >= 0.5) return base * sinF;
+  return CHARPENTE_DEMI_PORTEE_MIN_M;
+}
+
+/** Mur/poutre considéré porteur si le sens dalle n’est pas trop parallèle (|sin φ| ≥ 0,5). */
 function isWallBearingSlab(murEl, slabEl, sens) {
-  const wallAxis = getDominantPlanAxis(murEl);
-  const bearingAxis = getBearingPlanAxisFromSens(slabEl, sens);
-  if (!wallAxis || !bearingAxis) return true;
-  return bearingAxis !== wallAxis;
+  return getCarrierSlabBearingSinFactor(murEl, slabEl, sens) >= 0.5;
 }
 
 /**
@@ -2105,26 +2636,51 @@ function isWallBearingSlab(murEl, slabEl, sens) {
 function getSlabTopDeltaAlongAxis(slabEl, axisKey) {
   const prof = slabEl?.slabTopProfile;
   if (!prof || !axisKey) return 0;
-  return axisKey === "X" ? prof.deltaX : prof.deltaZ;
+  // Si on demande l'axe du mur et que la dalle a un profil local, utiliser deltaU
+  // quand l'axe mur est aligné avec dirU dalle, sinon deltaV.
+  if (Number.isFinite(prof.deltaU) || Number.isFinite(prof.deltaV)) {
+    return Math.max(prof.deltaU || 0, prof.deltaV || 0);
+  }
+  return axisKey === "X" ? (prof.deltaX || 0) : (prof.deltaZ || 0);
 }
 
 function isSlabTopNearlyHorizontal(slabEl) {
   const prof = slabEl?.slabTopProfile;
   if (!prof) return false;
-  return Math.max(prof.deltaX || 0, prof.deltaZ || 0) < WALL_SLOPE_MIN_DH * 0.5;
+  return Math.max(
+    prof.deltaU || 0,
+    prof.deltaV || 0,
+    prof.deltaX || 0,
+    prof.deltaZ || 0
+  ) < WALL_SLOPE_MIN_DH * 0.5;
 }
 
 /**
- * Classification géométrique simple d'une dalle :
- *   - "Rampante" si la dalle a une variation d'altitude > seuil (suit la pente du toit)
- *   - "Horiz."   sinon (dalle plate)
- * Indépendant du mur associé : c'est purement la géométrie de l'interface haute de la dalle.
+ * Classification géométrique auto d'une dalle (sans override) :
+ *   - "Rampante" si variation d'altitude > seuil (axe local U/V ou X/Z)
+ *   - "Horiz." sinon
  */
-function getSlabFormeKind(slabEl) {
+function getSlabFormeKindAuto(slabEl) {
   const prof = slabEl?.slabTopProfile;
   if (!prof) return "Horiz.";
-  const maxDelta = Math.max(prof.deltaX || 0, prof.deltaZ || 0);
+  const maxDelta = Math.max(
+    prof.deltaU || 0,
+    prof.deltaV || 0,
+    prof.deltaX || 0,
+    prof.deltaZ || 0
+  );
   return maxDelta >= WALL_SLOPE_MIN_DH * 0.5 ? "Rampante" : "Horiz.";
+}
+
+/**
+ * Forme dalle effective (override charpenteAttributes.formeOverride possible).
+ */
+function getSlabFormeKind(slabEl) {
+  const auto = getSlabFormeKindAuto(slabEl);
+  const id = slabEl?.id;
+  const ov = id != null ? state.charpenteAttributes?.[id]?.formeOverride : "";
+  if (ov === "Rampante" || ov === "Horiz.") return ov;
+  return auto;
 }
 
 function isSlabRampanteGeo(slabEl) {
@@ -2191,12 +2747,17 @@ function buildMassTableRows(cases, sdT, g) {
       rows.push({
         type: "Mur",
         id: c.murId,
-        arase: c.araseIndex + 1,
+        arase: c.araseIndex != null ? c.araseIndex + 1 : null,
         hArase: c.H_arase,
         stack: c.stack,
-        dalles: c.slabIds.join(", "),
+        dalles: (c.slabIds || []).length ? c.slabIds.join(", ") : "— (sans dalle)",
+        refHaute: c.refHauteLabel || formatWallRefLabel(c.refHauteKey, ""),
+        refBasse: c.refBasseLabel || formatWallRefLabel(c.refBasseKey, ""),
         hDalleTop: c.slabY,
         hCalcMur: c.hCalc,
+        hCalcNote: c.hCalcNote || null,
+        softWarning: c.softWarning || null,
+        userMode: c.userMode === true,
         mat: c.densKey || "—",
         masseMur: c.mMur,
         masseDalles: c.mDalles,
@@ -2243,8 +2804,13 @@ function buildMassTableRows(cases, sdT, g) {
         hArase: null,
         stack: c.stack,
         dalles: c.slabIds.join(", "),
+        refHaute: "—",
+        refBasse: "—",
         hDalleTop: null,
         hCalcMur: null,
+        hCalcNote: null,
+        softWarning: null,
+        userMode: false,
         mat: "BA 2500",
         masseMur: c.mMur,
         masseDalles: c.mDalles,
@@ -2507,130 +3073,132 @@ function getSdTandG() {
 function buildMassCases() {
   const cases = [];
 
-  // --- MURS ---
-  const mursCfg = state.wallAraseConfig?.murs || {};
-  for (const [murIdStr, arasesCfg] of Object.entries(mursCfg)) {
+  // --- MURS (wallCalcConfig : N stacks par mur, dalles optionnelles) ---
+  const mursCalc = state.wallCalcConfig?.murs || {};
+  for (const [murIdStr, rawCfg] of Object.entries(mursCalc)) {
     const murId = Number(murIdStr);
     const murEl = state.importedElements.find((e) => e.id === murId);
-    if (!murEl) continue;
-    const araseHeights = Array.isArray(murEl.araseHeights) ? murEl.araseHeights : null;
-    if (!araseHeights || !Array.isArray(arasesCfg)) continue;
+    if (!murEl || !rawCfg) continue;
+    const availableSlabs = state.murToSlabs?.[murId] || [];
+    const cfg = ensureWallCalcConfig(murId, availableSlabs);
+    if (!cfg.stackCount) continue;
 
-    for (let araseIndex = 0; araseIndex < arasesCfg.length; araseIndex++) {
-      const araseCfg = arasesCfg[araseIndex];
-      if (!araseCfg?.enabled) continue;
+    const topAraseIdx = getWallTopAraseIndex(murEl);
+    const araseHeights = Array.isArray(murEl.araseHeights) ? murEl.araseHeights : [];
+    const H_arase = araseHeights[topAraseIdx] ?? toNumberMaybe(murEl.height);
 
-      for (let stack = 1; stack <= 3; stack++) {
-        const slabIds = [];
-        for (const [slabIdStr, info] of Object.entries(araseCfg.slabs || {})) {
-          const slabId = Number(slabIdStr);
-          if (!Number.isFinite(slabId)) continue;
-          if (!info?.enabled) continue;
-          if (!info.stacks?.[stack - 1]) continue;
-          slabIds.push(slabId);
-        }
-        if (!slabIds.length) continue;
+    for (let si = 0; si < cfg.stackCount; si++) {
+      const st = cfg.stacks[si];
+      if (!st) continue;
+      const stack = si + 1;
+      const slabIds = Object.entries(st.slabs || {})
+        .filter(([, on]) => !!on)
+        .map(([sidStr]) => Number(sidStr))
+        .filter((sid) => Number.isFinite(sid));
 
-        const slabs = slabIds
-          .map((sid) => state.importedElements.find((e) => e.id === sid))
-          .filter(Boolean);
-        if (!slabs.length) continue;
+      const slabs = slabIds
+        .map((sid) => state.importedElements.find((e) => e.id === sid))
+        .filter(Boolean);
 
-        const slabTopYs = slabs.map(getSlabTopY).filter((v) => v != null);
-        const slabY = slabTopYs.length ? Math.max(...slabTopYs) : null;
+      const slabTopYs = slabs.map(getSlabTopY).filter((v) => v != null);
+      const slabY = slabTopYs.length ? Math.max(...slabTopYs) : null;
 
-        const H_arase = araseHeights[araseIndex];
-        ensureWallStackRefs(araseCfg);
-        const sr = araseCfg.stackRefs?.[stack];
-        let hCalc = null;
-        let massDetail = null;
-        if (sr) {
-          massDetail = computeWallStackMurMassDetail(murEl, araseIndex, slabIds, sr);
-          hCalc = massDetail?.hMur ?? null;
-        }
-        if (hCalc == null) {
-          hCalc = slabY != null ? computeWallHeightForMass(H_arase, slabY) : null;
-        }
-
-        const densKey = state.mursAttributes?.[murId]?.typeMurKey || "";
-        const dens = densKey ? getMaterialValue(densKey) : 0; // daN/m3
-        const t = getWallThickness(murEl) || 0;
-        let mMur;
-        if (massDetail?.mMurLinear != null) {
-          mMur = massDetail.mMurLinear;
-        } else {
-          mMur = hCalc != null ? dens * hCalc * 1 * t : 0;
-        }
-
-        const skipSlabs = massDetail?.skipSlabs === true;
-        let mDalles = 0;
-        const slabDetails = [];
-        if (!skipSlabs) {
-          for (const slabEl of slabs) {
-            const attrs = state.charpenteAttributes?.[slabEl.id] || {};
-            const m2 = getCharpenteMassPerM2(attrs);
-            const sens = attrs.sens || "";
-            const L = toNumberMaybe(slabEl.length) || 0;
-            const P = toNumberMaybe(slabEl.width) || 0;
-            const demiPorteeBase = getSlabDemiPorteeM(slabEl, sens);
-            const bearing = isWallBearingSlab(murEl, slabEl, sens);
-            const demiPortee = bearing ? demiPorteeBase : 0.5;
-            const m = m2.total * 1 * demiPortee;
-            mDalles += m;
-            slabDetails.push({
-              id: slabEl.id,
-              sens,
-              L,
-              P,
-              bearing,
-              demiPortee,
-              G: m2.G,
-              Q: m2.Q,
-              m2: m2.total,
-              m,
-            });
-          }
-        }
-
-        // Chaînage rampant requis si :
-        //  (1) réf. haute = réf. basse = "Pointe de pignon" (pignon pointe/pointe), OU
-        //  (2) au moins une dalle du stack est géométriquement rampante.
-        // ATTENTION : un mur classé "Rive" (ou non classé) reste toujours sur le chaînage
-        // horizontal, même si la dalle associée est géométriquement rampante.
-        const refHauteKey = sr ? String(sr.refHaute || "").trim() : "";
-        const refBasseKey = sr ? String(sr.refBasse || "").trim() : "";
-        const wallKind = classifyWallRoofFromProfiles(murEl).kind;
-        const wallAllowsRampant = wallKind === "Pignon" || wallKind === "Rampant";
-        const hasRampanteSlabGeo = slabs.some((s) => isSlabRampanteGeo(s));
-        const isPignonPointePointe =
-          refHauteKey === WALL_REF_PIGNON_POINTE && refBasseKey === WALL_REF_PIGNON_POINTE;
-        const useRampantChainage = wallAllowsRampant && (isPignonPointePointe || hasRampanteSlabGeo);
-
-        cases.push({
-          kind: "Mur",
-          murId,
-          araseIndex,
-          H_arase,
-          stack,
-          slabIds,
-          slabY,
-          hCalc,
-          densKey,
-          dens,
-          thickness: t,
-          mMur,
-          mDalles,
-          mPoutre: 0,
-          total: mMur + mDalles,
-          slabDetails,
-          pignonEffortPointe: massDetail?.effortPointeDaN ?? null,
-          pignonATriM2: massDetail?.ATriM2 ?? null,
-          skipSlabMass: skipSlabs,
-          refHauteKey,
-          refBasseKey,
-          useRampantChainage,
-        });
+      const sr = {
+        refHaute: st.refHaute,
+        refBasse: st.refBasse,
+        userHaute: st.userHaute,
+        userBasse: st.userBasse,
+      };
+      let hCalc = null;
+      let massDetail = null;
+      massDetail = computeWallStackMurMassDetail(murEl, topAraseIdx, slabIds, sr);
+      hCalc = massDetail?.hMur ?? null;
+      if (hCalc == null && slabY != null && H_arase != null) {
+        hCalc = computeWallHeightForMass(H_arase, slabY);
       }
+
+      const densKey = state.mursAttributes?.[murId]?.typeMurKey || "";
+      const dens = densKey ? getMaterialValue(densKey) : 0;
+      const t = getWallThickness(murEl) || 0;
+      let mMur;
+      if (massDetail?.mMurLinear != null) {
+        mMur = massDetail.mMurLinear;
+      } else {
+        mMur = hCalc != null ? dens * hCalc * 1 * t : 0;
+      }
+
+      const skipSlabs = massDetail?.skipSlabs === true || !slabs.length;
+      let mDalles = 0;
+      const slabDetails = [];
+      if (!skipSlabs) {
+        for (const slabEl of slabs) {
+          const attrs = state.charpenteAttributes?.[slabEl.id] || {};
+          const m2 = getCharpenteMassPerM2(attrs);
+          const sens = attrs.sens || "";
+          const L = toNumberMaybe(slabEl.length) || 0;
+          const P = toNumberMaybe(slabEl.width) || 0;
+          const demiPorteeBase = getSlabDemiPorteeM(slabEl, sens);
+          const bearingFactor = getCarrierSlabBearingSinFactor(murEl, slabEl, sens);
+          const bearing = bearingFactor >= 0.5;
+          const demiPortee = getCarrierSlabDemiPorteeM(murEl, slabEl, sens);
+          const m = m2.total * 1 * demiPortee;
+          mDalles += m;
+          slabDetails.push({
+            id: slabEl.id,
+            sens,
+            L,
+            P,
+            bearing,
+            bearingFactor,
+            takeMass: true,
+            demiPorteeBase,
+            demiPortee,
+            G: m2.G,
+            Q: m2.Q,
+            m2: m2.total,
+            m,
+          });
+        }
+      }
+
+      const refHauteKey = String(sr.refHaute || "").trim();
+      const refBasseKey = String(sr.refBasse || "").trim();
+      const wallKind = classifyWallRoofFromProfiles(murEl).kind;
+      const wallAllowsRampant = wallKind === "Pignon" || wallKind === "Rampant";
+      const hasRampanteSlabGeo = slabs.some((s) => isSlabRampanteGeo(s));
+      const isPignonPointePointe =
+        refHauteKey === WALL_REF_PIGNON_POINTE && refBasseKey === WALL_REF_PIGNON_POINTE;
+      const useRampantChainage = wallAllowsRampant && (isPignonPointePointe || hasRampanteSlabGeo);
+
+      cases.push({
+        kind: "Mur",
+        murId,
+        araseIndex: topAraseIdx,
+        H_arase,
+        stack,
+        slabIds,
+        slabY,
+        hCalc,
+        densKey,
+        dens,
+        thickness: t,
+        mMur,
+        mDalles,
+        mPoutre: 0,
+        total: mMur + mDalles,
+        slabDetails,
+        pignonEffortPointe: massDetail?.effortPointeDaN ?? null,
+        pignonATriM2: massDetail?.ATriM2 ?? null,
+        skipSlabMass: skipSlabs,
+        refHauteKey,
+        refBasseKey,
+        refHauteLabel: formatWallRefLabel(sr.refHaute, sr.userHaute),
+        refBasseLabel: formatWallRefLabel(sr.refBasse, sr.userBasse),
+        hCalcNote: massDetail?.hCalcNote || null,
+        softWarning: massDetail?.softWarning || null,
+        userMode: massDetail?.userMode === true,
+        useRampantChainage,
+      });
     }
   }
 
@@ -2694,9 +3262,13 @@ function buildMassCases() {
         const sens = attrs.sens || "";
         const L = toNumberMaybe(slabEl.length) || 0;
         const P = toNumberMaybe(slabEl.width) || 0;
+        const takeMass = bySlab?.[slabId]?.takeMass !== false;
         const demiPorteeBase = getSlabDemiPorteeM(slabEl, sens);
-        const bearing = isWallBearingSlab(poutreEl, slabEl, sens);
-        const demiPortee = bearing ? demiPorteeBase : 0.5;
+        const bearingFactor = getCarrierSlabBearingSinFactor(poutreEl, slabEl, sens);
+        const bearing = bearingFactor >= 0.5;
+        const demiPortee = takeMass
+          ? getCarrierSlabDemiPorteeM(poutreEl, slabEl, sens)
+          : 0;
         const m = m2.total * 1 * demiPortee;
         mDalles += m;
         const topY = getSlabTopY(slabEl);
@@ -2706,6 +3278,9 @@ function buildMassCases() {
           L,
           P,
           bearing,
+          bearingFactor,
+          takeMass,
+          demiPorteeBase,
           demiPortee,
           G: m2.G,
           Q: m2.Q,
@@ -2925,15 +3500,22 @@ function renderMassResults() {
 
   const dataRows = buildMassTableRows(cases, sdT, g);
   const rowsHtml = dataRows
-    .map((r) => `<tr>
+    .map((r) => {
+      const noteHtml = r.hCalcNote
+        ? `<div style="font-size:0.62rem;color:#94a3b8;margin-top:0.15rem;font-weight:600;">${escapeHtml(r.hCalcNote)}</div>`
+        : "";
+      const warnHtml = r.softWarning
+        ? `<div style="font-size:0.6rem;color:#fbbf24;margin-top:0.12rem;" title="${escapeHtml(r.softWarning)}">⚠ ${escapeHtml(r.softWarning)}</div>`
+        : "";
+      return `<tr${r.userMode ? ' style="background:rgba(251,191,36,0.06);"' : ""}>
       <td>${r.type}</td>
       <td class="num">${escapeHtml(r.id)}</td>
-      <td class="num">${r.arase ?? "—"}</td>
-      <td class="num">${formatNum(r.hArase)}</td>
       <td class="num">${r.stack ?? "—"}</td>
+      <td title="Référence haute">${escapeHtml(r.refHaute ?? "—")}</td>
+      <td title="Référence basse">${escapeHtml(r.refBasse ?? "—")}</td>
       <td>${escapeHtml(r.dalles)}</td>
       <td class="num">${formatNum(r.hDalleTop)}</td>
-      <td class="num">${formatNum(r.hCalcMur)}</td>
+      <td class="num">${formatNum(r.hCalcMur)}${noteHtml}${warnHtml}</td>
       <td>${escapeHtml(r.mat)}</td>
       <td class="num">${formatDaN(r.masseMur)}</td>
       <td class="num">${formatDaN(r.masseDalles)}</td>
@@ -2945,7 +3527,8 @@ function renderMassResults() {
       <td class="num"><b>${escapeHtml(r.verifieSur)}</b></td>
       <td class="num"><b>${escapeHtml(r.autoStab)}</b></td>
       <td class="num"><b>${escapeHtml(r.nbAncrage)}</b></td>
-    </tr>`)
+    </tr>`;
+    })
     .join("");
 
   massesResultsDiv.innerHTML = `
@@ -2955,9 +3538,9 @@ function renderMassResults() {
           <tr>
             <th>Type</th>
             <th class="num">ID</th>
-            <th class="num">Arase</th>
-            <th class="num">H arase [m]</th>
             <th class="num">Stack</th>
+            <th>Réf. haute</th>
+            <th>Réf. basse</th>
             <th>Dalles</th>
             <th class="num">H dalle (top) [m]</th>
             <th class="num">H calc mur [m]</th>
@@ -2978,7 +3561,10 @@ function renderMassResults() {
       </table>
     </div>
     <p style="margin-top:0.5rem; font-size:0.72rem; color:#9ca3af;">
-      Note: masses charpente = \(G + \\psi \\cdot Q\) (\\(\\psi\\) = facteur charges d’exploitation), demi-portée selon le sens porteur (X ou Y en plan).
+      Note: masses charpente = \(G + \\psi \\cdot Q\) (\\(\\psi\\) = facteur charges d’exploitation), demi-portée selon le sens porteur (X/Y monde ou ⊥ bord de dalle).
+    </p>
+    <p style="margin-top:0.25rem; font-size:0.72rem; color:#9ca3af;">
+      Réf. haute « Donnée utilisateur » : h<sub>calc</sub> = L<sub>h</sub>/2 (masse mur seule) ; les dalles cochées restent dans la masse dalle. Soft-warning si L<sub>h</sub> dépasse la hauteur mur au-dessus de la réf. basse.
     </p>
     <p style="margin-top:0.25rem; font-size:0.72rem; color:#9ca3af;">
       Effort en tête = Total × S_d(T) / g_r (avec S_d(T)=${sdT.toFixed(2)} m/s², g_r=${g.toFixed(2)} m/s²).
@@ -3397,6 +3983,7 @@ async function buildStudyExportData() {
     associationMask: state.associationMask || { murs: {}, poutres: {} },
     associationCounters: state.associationCounters || { murs: {}, poutres: {} },
     wallAraseConfig: state.wallAraseConfig || { murs: {} },
+    wallCalcConfig: state.wallCalcConfig || { murs: {} },
     poutreStackConfig: state.poutreStackConfig || {},
     selectedWallSegments: state.selectedWallSegments || {},
     effortsTopViewLabelPositions: state.effortsTopViewLabelPositions || {},
@@ -3484,6 +4071,9 @@ async function applyStudyData(study) {
     : { murs: {}, poutres: {} };
   state.wallAraseConfig = s.wallAraseConfig && typeof s.wallAraseConfig === "object"
     ? { murs: s.wallAraseConfig.murs || {} }
+    : { murs: {} };
+  state.wallCalcConfig = s.wallCalcConfig && typeof s.wallCalcConfig === "object"
+    ? { murs: s.wallCalcConfig.murs || {} }
     : { murs: {} };
   state.poutreStackConfig = s.poutreStackConfig && typeof s.poutreStackConfig === "object" ? s.poutreStackConfig : {};
   state.selectedWallSegments = s.selectedWallSegments && typeof s.selectedWallSegments === "object" ? s.selectedWallSegments : {};
@@ -3785,28 +4375,254 @@ function computeHeightSegmentsFromGeometry(geometry, matrixWorld) {
  * } | null}
  */
 /**
- * Analyse géométrique des faces du mur pour distinguer un VRAI rampant
- * (face supérieure inclinée DANS LE SENS DE LA LONGUEUR du mur) d'un mur
- * à arases multiples (faces supérieures horizontales à des niveaux différents)
- * ou d'un mur dont la face supérieure n'est qu'un chanfrein perpendiculaire
- * à son axe (cas d'un mur "rive" sous long-pan : la pente du toit traverse
- * juste la faible épaisseur du mur).
- *
- * Pour chaque triangle de la géométrie :
- *  - on calcule la normale dans le repère MONDE ;
- *  - si ny > 0.92 → face quasi-horizontale (dessus plat) ;
- *  - si 0.18 < ny ≤ 0.92 → face supérieure inclinée. On projette alors la
- *    composante horizontale de la normale (nx, nz) et on classe l'aire :
- *      • inclinedAlongXArea : pente dont le sens descendant est plutôt selon
- *        l'axe monde X ;
- *      • inclinedAlongZArea : pente dont le sens descendant est plutôt selon
- *        l'axe monde Z.
- *
- * Le `classifyWallRoofFromProfiles` combinera ensuite ces aires avec l'axe
- * dominant du mur pour ne retenir comme Rampant/Pignon que les pentes
- * effectivement orientées dans la longueur du mur.
+ * Repère horizontal local (PCA 2D sur XZ) pour un mesh.
+ * - dirU = axe principal (longueur du mur / côté long de la dalle)
+ * - dirV = perpendiculaire horizontal
+ * - span / thickness = étendues selon U / V
+ * - edgeDirs = directions d'arêtes horizontales clusterisées (pour sens porteur dalle)
  */
-function computeWallTopFaceInfo(geometry, matrixWorld) {
+function computePlanFrameFromGeometry(geometry, matrixWorld) {
+  const pos = geometry?.attributes?.position;
+  const index = geometry?.index;
+  if (!pos || !matrixWorld) return null;
+  const arr = pos.array;
+  const v = new THREE.Vector3();
+  const pts = [];
+
+  const pushVi = (vi) => {
+    const i3 = vi * 3;
+    v.set(arr[i3], arr[i3 + 1], arr[i3 + 2]).applyMatrix4(matrixWorld);
+    pts.push({ x: v.x, y: v.y, z: v.z });
+  };
+  if (index?.array?.length) {
+    const idx = index.array;
+    for (let i = 0; i < idx.length; i++) pushVi(idx[i]);
+  } else {
+    for (let i = 0; i < arr.length / 3; i++) pushVi(i);
+  }
+  if (pts.length < 4) return null;
+
+  let meanX = 0, meanZ = 0;
+  for (const p of pts) { meanX += p.x; meanZ += p.z; }
+  meanX /= pts.length;
+  meanZ /= pts.length;
+
+  let cxx = 0, czz = 0, cxz = 0;
+  for (const p of pts) {
+    const dx = p.x - meanX;
+    const dz = p.z - meanZ;
+    cxx += dx * dx;
+    czz += dz * dz;
+    cxz += dx * dz;
+  }
+  // Vecteur propre de la plus grande valeur propre de [[cxx,cxz],[cxz,czz]]
+  const trace = cxx + czz;
+  const det = cxx * czz - cxz * cxz;
+  const disc = Math.max(0, trace * trace / 4 - det);
+  const lambda1 = trace / 2 + Math.sqrt(disc);
+  let ux, uz;
+  if (Math.abs(cxz) > 1e-12) {
+    ux = lambda1 - czz;
+    uz = cxz;
+  } else if (cxx >= czz) {
+    ux = 1; uz = 0;
+  } else {
+    ux = 0; uz = 1;
+  }
+  const uLen = Math.hypot(ux, uz);
+  if (uLen < 1e-12) { ux = 1; uz = 0; }
+  else { ux /= uLen; uz /= uLen; }
+  // Normaliser le sens (ux>0, ou uz>0 si ux≈0) pour stabilité
+  if (ux < -1e-9 || (Math.abs(ux) <= 1e-9 && uz < 0)) { ux = -ux; uz = -uz; }
+  const vx = -uz;
+  const vz = ux;
+
+  let minU = Infinity, maxU = -Infinity, minV = Infinity, maxV = -Infinity;
+  let maxY = -Infinity;
+  for (const p of pts) {
+    const u = (p.x - meanX) * ux + (p.z - meanZ) * uz;
+    const vv = (p.x - meanX) * vx + (p.z - meanZ) * vz;
+    if (u < minU) minU = u;
+    if (u > maxU) maxU = u;
+    if (vv < minV) minV = vv;
+    if (vv > maxV) maxV = vv;
+    if (p.y > maxY) maxY = p.y;
+  }
+  const span = Math.max(0, maxU - minU);
+  const thickness = Math.max(0, maxV - minV);
+  if (!(span > 1e-6 && thickness > 1e-6)) return null;
+
+  // Contour en plan XZ (enveloppe convexe) → 1 sens porteur ⊥ par direction de bord distincte
+  // (rectangle = 2, triangle = 3, trapèze = 3 typiquement, + X/Y monde dans l'UI).
+  const hullXZ = convexHullXZ(pts);
+  const edgeDirs = computeContourEdgeDirsXZ(pts, { ux, uz, vx, vz, span, thickness });
+
+  // Centre OBB = milieu de l’intervalle U/V (≠ moyenne des sommets si densité mesh irrégulière)
+  const midU = (minU + maxU) / 2;
+  const midV = (minV + maxV) / 2;
+  const centerX = meanX + ux * midU + vx * midV;
+  const centerZ = meanZ + uz * midU + vz * midV;
+
+  return {
+    dirU: { x: ux, z: uz },
+    dirV: { x: vx, z: vz },
+    span,
+    thickness,
+    meanX,
+    meanZ,
+    centerX,
+    centerZ,
+    minU,
+    maxU,
+    minV,
+    maxV,
+    hullXZ: Array.isArray(hullXZ) && hullXZ.length >= 3
+      ? hullXZ.map((p) => ({ x: p.x, z: p.z }))
+      : null,
+    edgeDirs,
+  };
+}
+
+/** Angle non orienté [0, 180) en degrés pour une direction horizontale. */
+function planAngleDeg180(ax, az) {
+  let ang = (Math.atan2(az, ax) * 180) / Math.PI;
+  if (ang < 0) ang += 180;
+  if (ang >= 180) ang -= 180;
+  return ang;
+}
+
+/**
+ * Enveloppe convexe 2D (Andrew) sur points {x,z}.
+ * @returns {{x:number,z:number}[]}
+ */
+function convexHullXZ(points) {
+  if (!points?.length) return [];
+  const uniq = [];
+  const keySet = new Set();
+  for (const p of points) {
+    const k = `${Math.round(p.x * 1000)}_${Math.round(p.z * 1000)}`;
+    if (keySet.has(k)) continue;
+    keySet.add(k);
+    uniq.push({ x: p.x, z: p.z });
+  }
+  if (uniq.length < 3) return uniq;
+  uniq.sort((a, b) => (a.x === b.x ? a.z - b.z : a.x - b.x));
+  const cross = (o, a, b) => (a.x - o.x) * (b.z - o.z) - (a.z - o.z) * (b.x - o.x);
+  const lower = [];
+  for (const p of uniq) {
+    while (lower.length >= 2 && cross(lower[lower.length - 2], lower[lower.length - 1], p) <= 0) lower.pop();
+    lower.push(p);
+  }
+  const upper = [];
+  for (let i = uniq.length - 1; i >= 0; i--) {
+    const p = uniq[i];
+    while (upper.length >= 2 && cross(upper[upper.length - 2], upper[upper.length - 1], p) <= 0) upper.pop();
+    upper.push(p);
+  }
+  lower.pop();
+  upper.pop();
+  return lower.concat(upper);
+}
+
+/**
+ * Directions de bords du contour (cluster ±5°) + fallback U/V rectangle.
+ * @param {{x:number,y?:number,z:number}[]} pts
+ * @param {{ux:number,uz:number,vx:number,vz:number,span:number,thickness:number}} frame
+ */
+function computeContourEdgeDirsXZ(pts, frame) {
+  const ANGLE_TOL = 5;
+  const hull = convexHullXZ(pts);
+  const buckets = []; // { angleDeg, length }
+  const pushEdge = (ax, az, bx, bz) => {
+    const dx = bx - ax;
+    const dz = bz - az;
+    const len = Math.hypot(dx, dz);
+    if (len < 0.05) return;
+    let ang = planAngleDeg180(dx, dz);
+    let found = null;
+    for (const buck of buckets) {
+      let d = Math.abs(buck.angleDeg - ang);
+      if (d > 90) d = 180 - d;
+      if (d <= ANGLE_TOL) {
+        found = buck;
+        break;
+      }
+    }
+    if (found) {
+      const w = found.length;
+      found.angleDeg = (found.angleDeg * w + ang * len) / (w + len);
+      found.length += len;
+    } else {
+      buckets.push({ angleDeg: ang, length: len });
+    }
+  };
+  if (hull.length >= 3) {
+    for (let i = 0; i < hull.length; i++) {
+      const a = hull[i];
+      const b = hull[(i + 1) % hull.length];
+      pushEdge(a.x, a.z, b.x, b.z);
+    }
+  }
+  // Filtrer bruit mesh (très courtes) mais garder les petits côtés (triangle/trapèze/rectangle mince)
+  buckets.sort((a, b) => b.length - a.length);
+  const maxLen = buckets[0]?.length || 0;
+  const minKeep = Math.max(0.08, maxLen * 0.02);
+  let kept = buckets.filter((b) => b.length >= minKeep);
+
+  const mergeAng = (list, ang, len) => {
+    for (const buck of list) {
+      let d = Math.abs(buck.angleDeg - ang);
+      if (d > 90) d = 180 - d;
+      if (d <= ANGLE_TOL) {
+        buck.length = Math.max(buck.length, len);
+        return;
+      }
+    }
+    list.push({ angleDeg: ang, length: len });
+  };
+  // Toujours assurer U et V (repli rectangle) si absents du contour
+  if (frame) {
+    mergeAng(kept, planAngleDeg180(frame.ux, frame.uz), frame.span || 1);
+    mergeAng(kept, planAngleDeg180(frame.vx, frame.vz), frame.thickness || 1);
+  }
+  if (kept.length < 1 && frame) {
+    kept = [
+      { angleDeg: planAngleDeg180(frame.ux, frame.uz), length: frame.span || 1 },
+      { angleDeg: planAngleDeg180(frame.vx, frame.vz), length: frame.thickness || 1 },
+    ];
+  }
+  kept.sort((a, b) => b.length - a.length);
+  // Au plus 6 directions (triangle / trapèze / polygone)
+  kept = kept.slice(0, 6);
+  return kept.map((buck, i) => {
+    let ang = buck.angleDeg;
+    if (ang < 0) ang += 180;
+    if (ang >= 180) ang -= 180;
+    const rad = (ang * Math.PI) / 180;
+    let ex = Math.cos(rad);
+    let ez = Math.sin(rad);
+    if (ex < -1e-9 || (Math.abs(ex) <= 1e-9 && ez < 0)) {
+      ex = -ex;
+      ez = -ez;
+    }
+    const angR = Math.round(ang);
+    return {
+      edge: { x: ex, z: ez },
+      perp: { x: -ez, z: ex },
+      angleDeg: angR,
+      length: buck.length,
+      label: `⊥ bord ${angR}°`,
+      index: i,
+    };
+  });
+}
+
+/**
+ * Faces supérieures inclinées projetées dans le repère local (dirU / dirV).
+ * @param {{x:number,z:number}|null} dirU
+ * @param {{x:number,z:number}|null} dirV
+ */
+function computeWallTopFaceInfo(geometry, matrixWorld, dirU = null, dirV = null) {
   const pos = geometry?.attributes?.position;
   const index = geometry?.index;
   if (!pos || !matrixWorld) return null;
@@ -3822,11 +4638,16 @@ function computeWallTopFaceInfo(geometry, matrixWorld) {
   const n = new THREE.Vector3();
 
   let inclinedTopArea = 0;
+  let inclinedAlongUArea = 0;
+  let inclinedAlongVArea = 0;
   let inclinedAlongXArea = 0;
   let inclinedAlongZArea = 0;
   let flatTopArea = 0;
   let totalArea = 0;
   let maxInclineAngleDeg = 0;
+
+  const uOk = dirU && Number.isFinite(dirU.x) && Number.isFinite(dirU.z);
+  const vOk = dirV && Number.isFinite(dirV.x) && Number.isFinite(dirV.z);
 
   for (let i = 0; i + 2 < idx.length; i += 3) {
     const ia = idx[i] * 3;
@@ -3845,29 +4666,38 @@ function computeWallTopFaceInfo(geometry, matrixWorld) {
     n.divideScalar(len);
     totalArea += area;
     const ny = n.y;
-    // Seuil "plat" : ny > 0.985 ≈ pente < 10° (tolérance numérique uniquement).
-    // Les toitures de 12° à 30° (typiques) doivent être considérées "inclinées".
     if (ny > 0.985) {
       flatTopArea += area;
     } else if (ny > 0.18) {
-      // Face supérieure réellement inclinée
       inclinedTopArea += area;
       const angleDeg = Math.acos(Math.min(1, Math.max(-1, ny))) * 180 / Math.PI;
       if (angleDeg > maxInclineAngleDeg) maxInclineAngleDeg = angleDeg;
-      // Décomposition de la direction de pente (sens descendant projeté à l'horizontale)
       const nxAbs = Math.abs(n.x);
       const nzAbs = Math.abs(n.z);
       const horizMag = Math.sqrt(nxAbs * nxAbs + nzAbs * nzAbs);
       if (horizMag > 1e-6) {
         if (nxAbs >= nzAbs) inclinedAlongXArea += area;
         else inclinedAlongZArea += area;
+        if (uOk && vOk) {
+          const du = Math.abs(n.x * dirU.x + n.z * dirU.z);
+          const dv = Math.abs(n.x * dirV.x + n.z * dirV.z);
+          if (du >= dv) inclinedAlongUArea += area;
+          else inclinedAlongVArea += area;
+        }
       }
     }
   }
 
   if (totalArea <= 0) return null;
+  // Compat : si pas de repère local, U/V = X/Z
+  if (!uOk) {
+    inclinedAlongUArea = inclinedAlongXArea;
+    inclinedAlongVArea = inclinedAlongZArea;
+  }
   return {
     inclinedTopArea,
+    inclinedAlongUArea,
+    inclinedAlongVArea,
     inclinedAlongXArea,
     inclinedAlongZArea,
     flatTopArea,
@@ -3878,7 +4708,11 @@ function computeWallTopFaceInfo(geometry, matrixWorld) {
   };
 }
 
-function computeWallTopProfilesFromGeometry(geometry, matrixWorld, bins = WALL_SLOPE_BINS) {
+/**
+ * Profils d'altitude selon le repère local U/V (fallback X/Z monde).
+ * Retourne aussi maxYByXBin/maxYByZBin pour compatibilité.
+ */
+function computeWallTopProfilesFromGeometry(geometry, matrixWorld, bins = WALL_SLOPE_BINS, planFrame = null) {
   const pos = geometry?.attributes?.position;
   const index = geometry?.index;
   if (!pos || !matrixWorld) return null;
@@ -3886,52 +4720,92 @@ function computeWallTopProfilesFromGeometry(geometry, matrixWorld, bins = WALL_S
   const arr = pos.array;
   const v = new THREE.Vector3();
 
-  // bbox monde (sur indices si possible)
-  let minX = Infinity, minZ = Infinity;
-  let maxX = -Infinity, maxZ = -Infinity;
-  const consumeXZ = (vi) => {
+  const useLocal = planFrame && planFrame.dirU && planFrame.span > 0 && planFrame.thickness > 0;
+  const ux = useLocal ? planFrame.dirU.x : 1;
+  const uz = useLocal ? planFrame.dirU.z : 0;
+  const vx = useLocal ? planFrame.dirV.x : 0;
+  const vz = useLocal ? planFrame.dirV.z : 1;
+  const meanX = useLocal ? planFrame.meanX : 0;
+  const meanZ = useLocal ? planFrame.meanZ : 0;
+
+  let minU = Infinity, maxU = -Infinity, minV = Infinity, maxV = -Infinity;
+  let minX = Infinity, maxX = -Infinity, minZ = Infinity, maxZ = -Infinity;
+
+  const consume = (vi) => {
     const i3 = vi * 3;
     v.set(arr[i3], arr[i3 + 1], arr[i3 + 2]).applyMatrix4(matrixWorld);
+    const u = (v.x - meanX) * ux + (v.z - meanZ) * uz;
+    const vv = (v.x - meanX) * vx + (v.z - meanZ) * vz;
+    if (u < minU) minU = u;
+    if (u > maxU) maxU = u;
+    if (vv < minV) minV = vv;
+    if (vv > maxV) maxV = vv;
     if (v.x < minX) minX = v.x;
-    if (v.z < minZ) minZ = v.z;
     if (v.x > maxX) maxX = v.x;
+    if (v.z < minZ) minZ = v.z;
     if (v.z > maxZ) maxZ = v.z;
   };
-  if (index?.array && index.array.length) {
+  if (index?.array?.length) {
     const idx = index.array;
-    for (let i = 0; i < idx.length; i++) consumeXZ(idx[i]);
+    for (let i = 0; i < idx.length; i++) consume(idx[i]);
   } else {
-    for (let i = 0; i < arr.length / 3; i++) consumeXZ(i);
+    for (let i = 0; i < arr.length / 3; i++) consume(i);
   }
-  if (!isFinite(minX) || !isFinite(maxX) || maxX === minX || maxZ === minZ) return null;
+  if (!isFinite(minU) || maxU === minU || maxV === minV) return null;
 
+  const maxYByUBin = Array.from({ length: b }, () => -Infinity);
+  const maxYByVBin = Array.from({ length: b }, () => -Infinity);
   const maxYByXBin = Array.from({ length: b }, () => -Infinity);
   const maxYByZBin = Array.from({ length: b }, () => -Infinity);
 
   const push = (vi) => {
     const i3 = vi * 3;
     v.set(arr[i3], arr[i3 + 1], arr[i3 + 2]).applyMatrix4(matrixWorld);
-    const tx = (v.x - minX) / (maxX - minX);
-    const tz = (v.z - minZ) / (maxZ - minZ);
-    const ix = Math.min(b - 1, Math.max(0, Math.floor(tx * b)));
-    const iz = Math.min(b - 1, Math.max(0, Math.floor(tz * b)));
-    if (v.y > maxYByXBin[ix]) maxYByXBin[ix] = v.y;
-    if (v.y > maxYByZBin[iz]) maxYByZBin[iz] = v.y;
+    const u = (v.x - meanX) * ux + (v.z - meanZ) * uz;
+    const vv = (v.x - meanX) * vx + (v.z - meanZ) * vz;
+    const tu = (u - minU) / (maxU - minU);
+    const tv = (vv - minV) / (maxV - minV);
+    const iu = Math.min(b - 1, Math.max(0, Math.floor(tu * b)));
+    const iv = Math.min(b - 1, Math.max(0, Math.floor(tv * b)));
+    if (v.y > maxYByUBin[iu]) maxYByUBin[iu] = v.y;
+    if (v.y > maxYByVBin[iv]) maxYByVBin[iv] = v.y;
+    if (maxX !== minX && maxZ !== minZ) {
+      const tx = (v.x - minX) / (maxX - minX);
+      const tz = (v.z - minZ) / (maxZ - minZ);
+      const ix = Math.min(b - 1, Math.max(0, Math.floor(tx * b)));
+      const iz = Math.min(b - 1, Math.max(0, Math.floor(tz * b)));
+      if (v.y > maxYByXBin[ix]) maxYByXBin[ix] = v.y;
+      if (v.y > maxYByZBin[iz]) maxYByZBin[iz] = v.y;
+    }
   };
-
-  if (index?.array && index.array.length) {
+  if (index?.array?.length) {
     const idx = index.array;
     for (let i = 0; i < idx.length; i++) push(idx[i]);
   } else {
     for (let i = 0; i < arr.length / 3; i++) push(i);
   }
 
+  const finiteU = maxYByUBin.filter((n) => Number.isFinite(n));
+  const finiteV = maxYByVBin.filter((n) => Number.isFinite(n));
+  if (finiteU.length < 2 || finiteV.length < 2) return null;
+  const deltaU = Math.max(...finiteU) - Math.min(...finiteU);
+  const deltaV = Math.max(...finiteV) - Math.min(...finiteV);
   const finiteX = maxYByXBin.filter((n) => Number.isFinite(n));
   const finiteZ = maxYByZBin.filter((n) => Number.isFinite(n));
-  if (finiteX.length < 2 || finiteZ.length < 2) return null;
-  const deltaX = Math.max(...finiteX) - Math.min(...finiteX);
-  const deltaZ = Math.max(...finiteZ) - Math.min(...finiteZ);
-  return { maxYByXBin, maxYByZBin, deltaX, deltaZ };
+  const deltaX = finiteX.length >= 2 ? Math.max(...finiteX) - Math.min(...finiteX) : deltaU;
+  const deltaZ = finiteZ.length >= 2 ? Math.max(...finiteZ) - Math.min(...finiteZ) : deltaV;
+
+  return {
+    maxYByUBin,
+    maxYByVBin,
+    deltaU,
+    deltaV,
+    // Compat axes monde
+    maxYByXBin: finiteX.length >= 2 ? maxYByXBin : maxYByUBin,
+    maxYByZBin: finiteZ.length >= 2 ? maxYByZBin : maxYByVBin,
+    deltaX,
+    deltaZ,
+  };
 }
 
 function isMostlyMonotone(values, tol = 0.03) {
@@ -4000,84 +4874,100 @@ function isPeakInMiddle(values, tol = 0.03) {
   return leftOk && rightOk;
 }
 
-function classifyWallRoofFromProfiles(el) {
+function getWallAlongProfileBins(el) {
   const prof = el?.wallTopProfile;
-  if (!prof || !Number.isFinite(prof.deltaX) || !Number.isFinite(prof.deltaZ)) {
+  if (!prof) return null;
+  if (Array.isArray(prof.maxYByUBin) && prof.maxYByUBin.length) return prof.maxYByUBin;
+  const axis = getDominantPlanAxis(el);
+  if (!axis) return null;
+  return axis === "X" ? prof.maxYByXBin : prof.maxYByZBin;
+}
+
+function getWallAlongDelta(el) {
+  const prof = el?.wallTopProfile;
+  if (!prof) return null;
+  if (Number.isFinite(prof.deltaU)) return prof.deltaU;
+  const axis = getDominantPlanAxis(el);
+  if (!axis) return null;
+  return axis === "X" ? prof.deltaX : prof.deltaZ;
+}
+
+/**
+ * Classification auto Pignon / Rampant / Rive (sans override).
+ */
+function classifyWallRoofFromProfilesAuto(el) {
+  const prof = el?.wallTopProfile;
+  if (!prof) {
     return { kind: "Mur", araseCount: null, araseHeight: null };
   }
-  const wallAxis = getDominantPlanAxis(el);
-  if (!wallAxis) return { kind: "Mur", araseCount: null, araseHeight: null };
-  const along = wallAxis;
-  const deltaAlong = along === "X" ? prof.deltaX : prof.deltaZ;
-
   const araseHeight =
     Array.isArray(el?.araseHeights) && el.araseHeights.length
       ? toNumberMaybe(el.araseHeights[el.araseHeights.length - 1])
       : toNumberMaybe(el?.height);
 
-  // ────────────────────────────────────────────────────────────────────────
-  // CRITÈRE GÉOMÉTRIQUE PRIMAIRE : présence de faces inclinées dans la
-  // direction de la LONGUEUR du mur.
-  //   - Un VRAI rampant/pignon a sa pente le long de l'axe du mur.
-  //   - Un mur "rive" sous long-pan peut avoir un petit chanfrein de toiture
-  //     perpendiculaire à son axe (chanfrein dans l'épaisseur) : on ne doit
-  //     PAS le classer rampant.
-  //   - Un mur à plusieurs arases en gradin n'a aucune face supérieure
-  //     inclinée significative : il reste Rive.
-  // ────────────────────────────────────────────────────────────────────────
   const faceInfo = el?.wallTopFaceInfo;
   if (faceInfo) {
-    const alongAxisInclinedArea = along === "X" ? faceInfo.inclinedAlongXArea : faceInfo.inclinedAlongZArea;
-    const perpAxisInclinedArea  = along === "X" ? faceInfo.inclinedAlongZArea : faceInfo.inclinedAlongXArea;
-    // Seuils : au moins 0.50 m² de pente effective DANS LE SENS DE LA LONGUEUR
-    // et cette pente doit dominer (≥ 2×) une éventuelle pente perpendiculaire
-    // (chanfrein de toiture).
+    const alongAxisInclinedArea = Number.isFinite(faceInfo.inclinedAlongUArea)
+      ? faceInfo.inclinedAlongUArea
+      : (getDominantPlanAxis(el) === "X" ? faceInfo.inclinedAlongXArea : faceInfo.inclinedAlongZArea);
+    const perpAxisInclinedArea = Number.isFinite(faceInfo.inclinedAlongVArea)
+      ? faceInfo.inclinedAlongVArea
+      : (getDominantPlanAxis(el) === "X" ? faceInfo.inclinedAlongZArea : faceInfo.inclinedAlongXArea);
     const hasRealLongitudinalSlope = alongAxisInclinedArea >= 0.50
-      && alongAxisInclinedArea >= perpAxisInclinedArea * 2;
+      && alongAxisInclinedArea >= (perpAxisInclinedArea || 0) * 2;
     if (!hasRealLongitudinalSlope) {
       const araseCount = Array.isArray(el?.araseHeights) ? el.araseHeights.length : 1;
       return { kind: "Rive", araseCount, araseHeight };
     }
-    // Pente significative le long du mur → Rampant ou Pignon
-    const profileRaw = along === "X" ? prof.maxYByXBin : prof.maxYByZBin;
+    const profileRaw = getWallAlongProfileBins(el);
     const profile = fillMissingBins(profileRaw);
     const kind = isPeakInMiddle(profile) ? "Pignon" : "Rampant";
     return { kind, araseCount: 2, araseHeight };
   }
 
-  // ────────────────────────────────────────────────────────────────────────
-  // FALLBACK : ancienne logique basée uniquement sur les profils d'altitude
-  // (utile si l'analyse géométrique n'est pas disponible).
-  // ────────────────────────────────────────────────────────────────────────
+  const deltaAlong = getWallAlongDelta(el);
   const hasRealSlopeAlong = Number.isFinite(deltaAlong) && deltaAlong > WALL_SLOPE_MIN_DH;
   if (!hasRealSlopeAlong) {
     return { kind: "Rive", araseCount: 1, araseHeight };
   }
-  const profileRaw = along === "X" ? prof.maxYByXBin : prof.maxYByZBin;
+  const profileRaw = getWallAlongProfileBins(el);
   const profile = fillMissingBins(profileRaw);
   const kind = isPeakInMiddle(profile) ? "Pignon" : "Rampant";
   return { kind, araseCount: 2, araseHeight };
 }
 
-/** Cote monde Y max du faîtage (profil haut du mur, axe du mur). */
+/**
+ * Classification mur avec override manuel éventuel (mursAttributes.formeOverride).
+ */
+function classifyWallRoofFromProfiles(el) {
+  const auto = classifyWallRoofFromProfilesAuto(el);
+  const murId = el?.id;
+  const ov = murId != null ? state.mursAttributes?.[murId]?.formeOverride : "";
+  if (ov === "Pignon" || ov === "Rampant" || ov === "Rive") {
+    return {
+      ...auto,
+      kind: ov,
+      araseCount: ov === "Rive" ? (auto.araseCount || 1) : 2,
+      overridden: true,
+      autoKind: auto.kind,
+    };
+  }
+  return { ...auto, overridden: false, autoKind: auto.kind };
+}
+
+/** Cote monde Y max du faîtage (profil haut du mur, axe local U). */
 function getWallPignonPointeWorldY(murEl) {
-  const prof = murEl?.wallTopProfile;
-  if (!prof) return null;
-  const axis = getDominantPlanAxis(murEl);
-  if (!axis) return null;
-  const raw = axis === "X" ? prof.maxYByXBin : prof.maxYByZBin;
+  const raw = getWallAlongProfileBins(murEl);
+  if (!raw) return null;
   const arr = fillMissingBins(raw || []).filter((n) => Number.isFinite(n));
   if (!arr.length) return null;
   return Math.max(...arr);
 }
 
-/** Cote monde Y min du bas de pente (profil haut du mur le long de l’axe du mur). */
+/** Cote monde Y min du bas de pente (profil haut du mur le long de l’axe local). */
 function getWallPignonBasWorldY(murEl) {
-  const prof = murEl?.wallTopProfile;
-  if (!prof) return null;
-  const axis = getDominantPlanAxis(murEl);
-  if (!axis) return null;
-  const raw = axis === "X" ? prof.maxYByXBin : prof.maxYByZBin;
+  const raw = getWallAlongProfileBins(murEl);
+  if (!raw) return null;
   const arr = fillMissingBins(raw || []).filter((n) => Number.isFinite(n));
   if (!arr.length) return null;
   return Math.min(...arr);
@@ -4177,10 +5067,21 @@ async function getBboxFromSubset(expressID, options = {}) {
         result.heightSegments = heightSegments;
       }
     }
+    // Repère local horizontal (PCA) — nécessaire pour murs/dalles hors axes X/Z
+    if ((options.includeWallSlopeInfo || options.includePlanFrame) && subset.geometry) {
+      const planFrame = computePlanFrameFromGeometry(subset.geometry, subset.matrixWorld);
+      if (planFrame) result.planFrame = planFrame;
+    }
     if (options.includeWallSlopeInfo && subset.geometry) {
-      const prof = computeWallTopProfilesFromGeometry(subset.geometry, subset.matrixWorld, WALL_SLOPE_BINS);
+      const frame = result.planFrame || null;
+      const prof = computeWallTopProfilesFromGeometry(subset.geometry, subset.matrixWorld, WALL_SLOPE_BINS, frame);
       if (prof) result.wallTopProfile = prof;
-      const faceInfo = computeWallTopFaceInfo(subset.geometry, subset.matrixWorld);
+      const faceInfo = computeWallTopFaceInfo(
+        subset.geometry,
+        subset.matrixWorld,
+        frame?.dirU || null,
+        frame?.dirV || null
+      );
       if (faceInfo) result.wallTopFaceInfo = faceInfo;
     }
     return result;
@@ -4262,47 +5163,139 @@ async function updateHoverHighlight(expressID) {
   }
 }
 
+const ARASE_LEGEND_COLORS = [
+  0xf87171, 0xfbbf24, 0x34d399, 0x60a5fa, 0xa78bfa, 0xf472b6, 0x2dd4bf, 0xfbd38d, 0x94a3b8, 0xfb923c,
+];
+
+function clearAraseLegendBoxes() {
+  const scene = getViewerScene();
+  if (!scene) return;
+  const toRemove = [];
+  scene.traverse((obj) => {
+    if (obj?.name && String(obj.name).startsWith("__arase_legend_")) toRemove.push(obj);
+  });
+  toRemove.forEach((obj) => {
+    try {
+      scene.remove(obj);
+      obj.geometry?.dispose?.();
+      obj.material?.dispose?.();
+    } catch (_) {}
+  });
+  const leg = document.getElementById("arase-legend-overlay");
+  if (leg) leg.remove();
+  state.araseLegendMurId = null;
+}
+
+/** Bornes Y scène d'une arase (calées sur le pied heightBaseY, sans re-appliquer modelOffsetY). */
+function getAraseSegmentSceneBounds(el, index) {
+  if (!el || !Number.isInteger(index) || index < 0) return null;
+  const base = getWallBaseWorldY(el);
+  const Hs = Array.isArray(el.araseHeights) ? el.araseHeights : null;
+  if (base != null && Hs && Hs[index] != null) {
+    const topH = toNumberMaybe(Hs[index]);
+    const botH = index === 0 ? 0 : toNumberMaybe(Hs[index - 1]);
+    if (Number.isFinite(topH) && Number.isFinite(botH) && topH > botH) {
+      return { minY: base + botH, maxY: base + topH, height: topH - botH };
+    }
+  }
+  const seg = el.heightSegmentsDetail?.[index];
+  if (!seg) return null;
+  const minY = toNumberMaybe(seg.minY);
+  const maxY = toNumberMaybe(seg.maxY);
+  if (minY == null || maxY == null || maxY <= minY) return null;
+  // heightSegments déjà exprimés dans le même repère que el.y / heightBaseY (subset + offset)
+  return { minY, maxY, height: maxY - minY };
+}
+
+function showAraseLegendForMur(murId) {
+  clearAraseLegendBoxes();
+  const el = state.importedElements.find((e) => e.id === murId);
+  const scene = getViewerScene();
+  if (!el || !scene) return;
+  const nSeg = Array.isArray(el.araseHeights) && el.araseHeights.length
+    ? el.araseHeights.length
+    : (Array.isArray(el.heightSegmentsDetail) ? el.heightSegmentsDetail.length : 0);
+  if (!nSeg) return;
+  state.araseLegendMurId = murId;
+  const span = getWallSpanLength(el) || toNumberMaybe(el.length) || 0.2;
+  const thick0 = getWallThickness(el) || toNumberMaybe(el.width) || 0.2;
+  // Légèrement plus épais que le mur pour passer devant sans z-fighting / mélange de couleurs
+  const thick = thick0 + 0.01;
+  const u = getElementDirU(el);
+  const x = toNumberMaybe(el.x);
+  const z = toNumberMaybe(el.z);
+  if (x == null || z == null) return;
+
+  const legendItems = [];
+  for (let index = 0; index < nSeg; index++) {
+    const bounds = getAraseSegmentSceneBounds(el, index);
+    if (!bounds) continue;
+    const { minY, maxY, height } = bounds;
+    const color = ARASE_LEGEND_COLORS[index % ARASE_LEGEND_COLORS.length];
+    const geom = new THREE.BoxGeometry(span + 0.01, height, thick);
+    const mat = new THREE.MeshBasicMaterial({
+      color,
+      transparent: true,
+      opacity: 0.45,
+      depthWrite: false,
+    });
+    const mesh = new THREE.Mesh(geom, mat);
+    mesh.name = `__arase_legend_${murId}_${index}`;
+    mesh.position.set(x, (minY + maxY) / 2, z);
+    if (u) mesh.rotation.y = -Math.atan2(u.z, u.x);
+    scene.add(mesh);
+    legendItems.push({ index, color, h: height });
+  }
+
+  const overlay = document.createElement("div");
+  overlay.id = "arase-legend-overlay";
+  overlay.style.cssText =
+    "margin:0.35rem 0 0.15rem;padding:0.35rem 0.45rem;border-radius:0.35rem;background:rgba(15,23,42,0.95);border:1px solid rgba(148,163,184,0.45);font-size:0.68rem;color:#e2e8f0;";
+  overlay.innerHTML = `<div style="font-weight:600;margin-bottom:0.25rem;">Arases mur ${murId}</div>` +
+    legendItems
+      .map((it) => {
+        const hex = `#${it.color.toString(16).padStart(6, "0")}`;
+        return `<div style="display:flex;align-items:center;gap:0.35rem;margin:0.1rem 0;">
+          <span style="width:0.75rem;height:0.75rem;border-radius:2px;background:${hex};display:inline-block;"></span>
+          <span>Arase ${it.index + 1} · ${formatNum(it.h)} m</span>
+        </div>`;
+      })
+      .join("");
+  return overlay;
+}
+
 function showAraseHoverBox(el, segIndex) {
   const scene = getViewerScene();
   if (!scene || !el) return;
   removeObjectByNameFromScene("__arase_hover_box");
-  const seg =
-    el.heightSegmentsDetail &&
-    Array.isArray(el.heightSegmentsDetail) &&
-    el.heightSegmentsDetail[segIndex]
-      ? el.heightSegmentsDetail[segIndex]
-      : null;
-  if (!seg) return;
+  const bounds = getAraseSegmentSceneBounds(el, segIndex);
+  if (!bounds) return;
 
-  const length = toNumberMaybe(el.length);
-  const width = toNumberMaybe(el.width);
-  const minY = toNumberMaybe(seg.minY);
-  const maxY = toNumberMaybe(seg.maxY);
+  const span0 = getWallSpanLength(el) || toNumberMaybe(el.length);
+  const thick0 = getWallThickness(el) || toNumberMaybe(el.width);
   const x = toNumberMaybe(el.x);
   const z = toNumberMaybe(el.z);
-  if (
-    length == null ||
-    width == null ||
-    x == null ||
-    z == null ||
-    minY == null ||
-    maxY == null
-  ) {
-    return;
-  }
-  const height = maxY - minY;
-  if (height <= 0) return;
+  if (span0 == null || thick0 == null || x == null || z == null) return;
+  const { minY, maxY, height } = bounds;
+  if (!(height > 0)) return;
+  const span = span0 + 0.01;
+  const thick = thick0 + 0.01;
 
-  const geom = new THREE.BoxGeometry(length, height, width);
+  // BoxGeometry : X = span (axe long local), Z = épaisseur — puis rotation Y selon dirU
+  const geom = new THREE.BoxGeometry(span, height, thick);
   const mat = new THREE.MeshBasicMaterial({
-    color: 0xff4444, // rouge vif
+    color: 0xff4444,
     transparent: true,
     opacity: 0.35,
     depthWrite: false,
   });
   const mesh = new THREE.Mesh(geom, mat);
   mesh.name = "__arase_hover_box";
-  mesh.position.set(x, minY + height / 2, z);
+  mesh.position.set(x, (minY + maxY) / 2, z);
+  const u = getElementDirU(el);
+  if (u) {
+    mesh.rotation.y = -Math.atan2(u.z, u.x);
+  }
   scene.add(mesh);
 }
 
@@ -4942,17 +5935,47 @@ async function extractAndDisplayElements() {
       if (id == null) continue;
       const isWall = el.type && /WALL/i.test(String(el.type));
       const isSlab = el.type && /SLAB/i.test(String(el.type));
+      const isBeam = el.type && /BEAM/i.test(String(el.type));
       const bbox = await getBboxFromSubset(id, {
         includeHeightSegments: isWall,
         includeWallSlopeInfo: isWall || isSlab,
+        includePlanFrame: isWall || isSlab || isBeam,
       });
       if (bbox) {
         el.x = bbox.center.x;
         el.y = bbox.center.y;
         el.z = bbox.center.z;
-        el.length = bbox.size.x;
         el.height = bbox.size.y;
-        el.width = bbox.size.z;
+        // AABB monde (conservé pour debug / fallback)
+        el.aabbLength = bbox.size.x;
+        el.aabbWidth = bbox.size.z;
+        if (bbox.planFrame) {
+          el.dirU = bbox.planFrame.dirU;
+          el.dirV = bbox.planFrame.dirV;
+          el.span = bbox.planFrame.span;
+          el.thickness = bbox.planFrame.thickness;
+          el.edgeDirs = bbox.planFrame.edgeDirs || [];
+          el.planHullXZ = bbox.planFrame.hullXZ || null;
+          // Centre plan (OBB / hull) — évite le décalage AABB monde vs dalle orientée
+          if (Number.isFinite(bbox.planFrame.centerX) && Number.isFinite(bbox.planFrame.centerZ)) {
+            el.planCenterX = bbox.planFrame.centerX;
+            el.planCenterZ = bbox.planFrame.centerZ;
+            // Pour les dalles : ancrer aussi x/z sur le centre plan (vue plongeante + adjacences)
+            if (isSlab) {
+              el.x = bbox.planFrame.centerX;
+              el.z = bbox.planFrame.centerZ;
+            }
+          }
+          // Affichage L / P = dimensions locales (pas la bbox monde)
+          el.length = bbox.planFrame.span;
+          el.width = bbox.planFrame.thickness;
+        } else {
+          el.planHullXZ = null;
+          el.planCenterX = undefined;
+          el.planCenterZ = undefined;
+          el.length = bbox.size.x;
+          el.width = bbox.size.z;
+        }
         if (bbox.heightSegments && bbox.heightSegments.heights.length > 0) {
           el.heightSegments = bbox.heightSegments.heights;
           el.heightSegmentsDetail = bbox.heightSegments.segments;
@@ -4988,10 +6011,24 @@ async function extractAndDisplayElements() {
                   if (props) {
                     name = unwrapIfcValue(props.Name ?? props.name) ?? name;
                     const isWall = type === IFC.IFCWALL || type === IFC.IFCWALLSTANDARDCASE;
-                    const bbox = typeof id === "number" ? await getBboxFromSubset(id, { includeHeightSegments: isWall }) : null;
+                    const isSlabFb = type === IFC.IFCSLAB;
+                    const bbox = typeof id === "number"
+                      ? await getBboxFromSubset(id, {
+                          includeHeightSegments: isWall,
+                          includeWallSlopeInfo: isWall || isSlabFb,
+                          includePlanFrame: isWall || isSlabFb,
+                        })
+                      : null;
                     if (bbox) {
                       x = bbox.center.x; y = bbox.center.y; z = bbox.center.z;
-                      length = bbox.size.x; height = bbox.size.y; width = bbox.size.z;
+                      height = bbox.size.y;
+                      if (bbox.planFrame) {
+                        length = bbox.planFrame.span;
+                        width = bbox.planFrame.thickness;
+                      } else {
+                        length = bbox.size.x;
+                        width = bbox.size.z;
+                      }
                       if (bbox.heightSegments && bbox.heightSegments.heights.length > 0) {
                         heightSegments = bbox.heightSegments.heights;
                         heightSegmentsDetail = bbox.heightSegments.segments;
@@ -5034,6 +6071,34 @@ async function extractAndDisplayElements() {
   elementsPanel.style.display = "block";
   renderElementsTables();
   bindElementsFilters();
+  // Audit adjacences (murs↔dalles) après import — utile debug / QA
+  try {
+    const adj = computeAdjacencesMurDalle();
+    window.__effortAdjAudit = {
+      murDallePairs: adj.murDallePairs,
+      poutreDallePairs: adj.poutreDallePairs,
+      murs: state.importedElements
+        .filter((e) => matchesCategory(e, "murs"))
+        .map((e) => ({
+          id: e.id,
+          span: e.span,
+          thickness: e.thickness,
+          dirU: e.dirU,
+          slabs: state.murToSlabs?.[e.id] || [],
+        })),
+      dalles: state.importedElements
+        .filter((e) => matchesCategory(e, "charpente"))
+        .map((e) => ({
+          id: e.id,
+          span: e.span,
+          thickness: e.thickness,
+          dirU: e.dirU,
+          murs: state.slabToMurs?.[e.id] || [],
+        })),
+    };
+  } catch (err) {
+    console.warn("Audit adjacences:", err);
+  }
 }
 
 function formatNum(v) {
@@ -5172,44 +6237,62 @@ function renderElementsTables() {
         : `<td class="num">${formatNum(e.height)}</td>`;
       let formeCell = "";
       if (category === "charpente") {
-        const forme = getSlabFormeKind(e);
+        const autoForme = getSlabFormeKindAuto(e);
+        const ov = state.charpenteAttributes?.[e.id]?.formeOverride || "";
+        const forme = ov || autoForme;
         const prof = e.slabTopProfile;
         const deltaTxt = prof
-          ? `ΔX=${formatNum(prof.deltaX)} m · ΔZ=${formatNum(prof.deltaZ)} m`
-          : "Profil non calculé";
-        const cls = forme === "Rampante" ? "forme-rampante" : "forme-horiz";
-        formeCell = `<td title="${escapeHtml(deltaTxt)}" style="font-weight:600;${forme === "Rampante" ? "color:#fb923c;" : "color:#cbd5f5;"}" class="${cls}">${forme}</td>`;
+          ? `Auto=${autoForme} · ΔU=${formatNum(prof.deltaU ?? prof.deltaX)} m · ΔV=${formatNum(prof.deltaV ?? prof.deltaZ)} m`
+          : `Auto=${autoForme}`;
+        const color = forme === "Rampante" ? "#fb923c" : "#cbd5f5";
+        formeCell = `<td title="${escapeHtml(deltaTxt)}" style="color:${color};">
+          <select class="forme-override-select" data-kind="slab" data-id="${e.id}" style="font-weight:600;color:${color};background:#0f172a;border:1px solid rgba(148,163,184,0.4);border-radius:4px;padding:0.1rem 0.25rem;">
+            <option value="" ${!ov ? "selected" : ""}>Auto (${escapeHtml(autoForme)})</option>
+            <option value="Horiz." ${ov === "Horiz." ? "selected" : ""}>Horiz.</option>
+            <option value="Rampante" ${ov === "Rampante" ? "selected" : ""}>Rampante</option>
+          </select>
+        </td>`;
       } else if (category === "murs") {
         const info = classifyWallRoofFromProfiles(e);
+        const autoKind = info?.autoKind || classifyWallRoofFromProfilesAuto(e).kind || "Mur";
         const kind = info?.kind || "Mur";
-        const display = kind === "Mur" ? "—" : kind;
+        const ov = state.mursAttributes?.[e.id]?.formeOverride || "";
         let color = "#cbd5f5";
-        if (kind === "Pignon") color = "#f87171";   // rouge clair
-        else if (kind === "Rampant") color = "#fb923c"; // orange
-        else if (kind === "Rive") color = "#86efac"; // vert clair
+        if (kind === "Pignon") color = "#f87171";
+        else if (kind === "Rampant") color = "#fb923c";
+        else if (kind === "Rive") color = "#86efac";
         const prof = e.wallTopProfile;
         const faceInfo = e.wallTopFaceInfo;
-        const titleParts = [];
-        if (prof) titleParts.push(`ΔX=${formatNum(prof.deltaX)} m · ΔZ=${formatNum(prof.deltaZ)} m`);
-        else titleParts.push("Profil haut non calculé");
-        if (info?.araseCount) titleParts.push(`${info.araseCount} arase(s)`);
+        const titleParts = [`Auto=${autoKind}`];
+        const elThickness = getWallThickness(e);
+        const elSpan = getWallSpanLength(e);
+        if (Number.isFinite(elThickness)) titleParts.push(`ép=${formatNum(elThickness)} m`);
+        if (Number.isFinite(elSpan)) titleParts.push(`L=${formatNum(elSpan)} m`);
+        if (prof) titleParts.push(`ΔU=${formatNum(prof.deltaU ?? prof.deltaX)} · ΔV=${formatNum(prof.deltaV ?? prof.deltaZ)}`);
         if (faceInfo) {
-          titleParts.push(`Pente sup. selon X = ${formatNum(faceInfo.inclinedAlongXArea ?? 0)} m²`);
-          titleParts.push(`Pente sup. selon Z = ${formatNum(faceInfo.inclinedAlongZArea ?? 0)} m²`);
-          titleParts.push(`Faces plates sup. = ${formatNum(faceInfo.flatTopArea)} m²`);
-          if (faceInfo.maxInclineAngleDeg > 0) titleParts.push(`Pente max ≈ ${formatNum(faceInfo.maxInclineAngleDeg)}°`);
+          titleParts.push(`pente U=${formatNum(faceInfo.inclinedAlongUArea ?? 0)} m²`);
+          titleParts.push(`pente V=${formatNum(faceInfo.inclinedAlongVArea ?? 0)} m²`);
         }
-        formeCell = `<td title="${escapeHtml(titleParts.join(" · "))}" style="font-weight:600; color:${color};">${escapeHtml(display)}</td>`;
+        formeCell = `<td title="${escapeHtml(titleParts.join(" · "))}" style="color:${color};">
+          <select class="forme-override-select" data-kind="mur" data-id="${e.id}" style="font-weight:600;color:${color};background:#0f172a;border:1px solid rgba(148,163,184,0.4);border-radius:4px;padding:0.1rem 0.25rem;">
+            <option value="" ${!ov ? "selected" : ""}>Auto (${escapeHtml(autoKind === "Mur" ? "—" : autoKind)})</option>
+            <option value="Pignon" ${ov === "Pignon" ? "selected" : ""}>Pignon</option>
+            <option value="Rampant" ${ov === "Rampant" ? "selected" : ""}>Rampant</option>
+            <option value="Rive" ${ov === "Rive" ? "selected" : ""}>Rive</option>
+          </select>
+        </td>`;
       }
+      const Ldisp = formatNum(e.span ?? e.length);
+      const Pdisp = formatNum(e.thickness ?? e.width);
       tr.innerHTML = `
         <td class="num">${escapeHtml(String(e.id ?? "—"))}</td>
         <td>${escapeHtml(safeType)}</td>
         <td class="num">${formatNum(e.x)}</td>
         <td class="num">${formatNum(e.y)}</td>
         <td class="num">${formatNum(e.z)}</td>
-        <td class="num">${formatNum(e.length)}</td>
+        <td class="num" title="Longueur locale (span)">${Ldisp}</td>
         ${heightCell}
-        <td class="num">${formatNum(e.width)}</td>
+        <td class="num" title="Épaisseur locale (thickness)">${Pdisp}</td>
         <td title="Propriétés brutes">${Object.keys(e.rawProps || {}).length ? "Oui" : "—"}</td>
         ${formeCell}
       `;
@@ -5217,7 +6300,8 @@ function renderElementsTables() {
     }
 
     tbody.querySelectorAll("tr").forEach((row) => {
-      row.addEventListener("click", async () => {
+      row.addEventListener("click", async (ev) => {
+        if (ev.target?.closest?.("select")) return;
         const id = Number(row.dataset.expressId);
         if (!Number.isFinite(id)) return;
         await handleExpressIdSelectionFrom3D(id);
@@ -5231,6 +6315,30 @@ function renderElementsTables() {
 
       row.addEventListener("mouseleave", () => {
         clearHoverHighlight();
+      });
+    });
+
+    tbody.querySelectorAll("select.forme-override-select").forEach((sel) => {
+      sel.addEventListener("click", (ev) => ev.stopPropagation());
+      sel.addEventListener("change", (ev) => {
+        ev.stopPropagation();
+        const id = Number(sel.dataset.id);
+        const kind = sel.dataset.kind;
+        const val = sel.value || "";
+        if (!Number.isFinite(id)) return;
+        if (kind === "mur") {
+          if (!state.mursAttributes[id]) state.mursAttributes[id] = {};
+          if (val) state.mursAttributes[id].formeOverride = val;
+          else delete state.mursAttributes[id].formeOverride;
+        } else if (kind === "slab") {
+          if (!state.charpenteAttributes[id]) state.charpenteAttributes[id] = {};
+          if (val) state.charpenteAttributes[id].formeOverride = val;
+          else delete state.charpenteAttributes[id].formeOverride;
+        }
+        // Rafraîchir labels 3D / association sans tout recharger
+        try { updateMassWallLabels?.(); } catch (_) {}
+        try { updateSlabLabels?.(); } catch (_) {}
+        renderElementsTables();
       });
     });
   };
@@ -5274,6 +6382,10 @@ function disposeBearingArrowGroup(group) {
   });
 }
 
+/** Sens en aperçu au survol d’une option du menu (null = valeur sélectionnée). */
+let charpenteSensPreviewValue = null;
+let charpenteSensMenuOpen = false;
+
 function clearCharpenteBearingArrows() {
   const scene = getViewerScene();
   slabBearingArrowObjects.forEach((obj) => {
@@ -5283,6 +6395,10 @@ function clearCharpenteBearingArrows() {
   slabBearingArrowObjects.clear();
 }
 
+/**
+ * Affiche les flèches de portée 3D pour les dalles charpente sélectionnées.
+ * Si charpenteSensPreviewValue !== null → aperçu du sens survolé ("" = aucune flèche).
+ */
 function updateCharpenteBearingArrows() {
   clearCharpenteBearingArrows();
   if (currentMainTab !== "definir") return;
@@ -5290,32 +6406,81 @@ function updateCharpenteBearingArrows() {
   const scene = getViewerScene();
   if (!scene) return;
 
+  const previewActive = charpenteSensPreviewValue !== null;
   const ids = getSelectedCharpenteIds();
   ids.forEach((id) => {
     const slabEl = state.importedElements.find((e) => e.id === id);
     if (!slabEl) return;
-    const sensRaw = state.charpenteAttributes?.[id]?.sens || charpenteSensSelect?.value || "";
+    const sensRaw = previewActive
+      ? charpenteSensPreviewValue
+      : state.charpenteAttributes?.[id]?.sens || charpenteSensSelect?.value || "";
     const sens = normalizeCharpenteSens(slabEl, sensRaw);
     if (!sens) return;
     const dir = getSlabBearingDirUnitXZ(slabEl, sens);
     if (!dir) return;
     const span = getSlabBearingSpanM(slabEl, sens);
     const topY = getSlabTopY(slabEl);
+    const botY = getSlabBottomY(slabEl);
     const cx = toNumberMaybe(slabEl.x);
     const cz = toNumberMaybe(slabEl.z);
     if (topY == null || cx == null || cz == null || span <= 0) return;
 
-    const center = new THREE.Vector3(cx, topY + 0.08, cz);
     const half = Math.min(span * 0.42, 2.8) / 2;
     const group = new THREE.Group();
-    const color = 0x4c1d95;
+    // Aperçu (survol) orange pour distinguer du sens déjà choisi (violet)
+    const color = previewActive ? 0xd97706 : 0x4c1d95;
+    const colorBelow = previewActive ? 0xfbbf24 : 0x7c3aed;
     const headLen = Math.max(0.12, half * 0.18);
     const headW = headLen * 0.55;
-    group.add(new THREE.ArrowHelper(dir, center, half, color, headLen, headW));
-    group.add(new THREE.ArrowHelper(dir.clone().negate(), center, half, color, headLen, headW));
+    const addPair = (y, col) => {
+      const center = new THREE.Vector3(cx, y, cz);
+      group.add(new THREE.ArrowHelper(dir.clone(), center, half, col, headLen, headW));
+      group.add(new THREE.ArrowHelper(dir.clone().negate(), center, half, col, headLen, headW));
+    };
+    addPair(topY + 0.08, color);
+    if (botY != null) addPair(botY - 0.08, colorBelow);
     scene.add(group);
     slabBearingArrowObjects.set(id, group);
   });
+}
+
+function setCharpenteSensPreview(sensOrNull) {
+  charpenteSensPreviewValue = sensOrNull;
+  updateCharpenteBearingArrows();
+}
+
+function closeCharpenteSensMenu() {
+  if (!charpenteSensMenu) return;
+  charpenteSensMenu.hidden = true;
+  charpenteSensMenuOpen = false;
+  if (charpenteSensToggle) charpenteSensToggle.setAttribute("aria-expanded", "false");
+  setCharpenteSensPreview(null);
+}
+
+function openCharpenteSensMenu() {
+  if (!charpenteSensMenu) return;
+  charpenteSensMenu.hidden = false;
+  charpenteSensMenuOpen = true;
+  if (charpenteSensToggle) charpenteSensToggle.setAttribute("aria-expanded", "true");
+}
+
+function syncCharpenteSensToggleLabel() {
+  if (!charpenteSensToggle || !charpenteSensSelect) return;
+  const val = charpenteSensSelect.value || "";
+  const opt = [...charpenteSensSelect.options].find((o) => o.value === val);
+  charpenteSensToggle.textContent = opt?.textContent || "—";
+}
+
+function setCharpenteSensValue(value, { fireChange = true } = {}) {
+  if (!charpenteSensSelect) return;
+  charpenteSensSelect.value = value ?? "";
+  syncCharpenteSensToggleLabel();
+  charpenteSensPreviewValue = null;
+  if (fireChange) {
+    charpenteSensSelect.dispatchEvent(new Event("change", { bubbles: true }));
+  } else {
+    updateCharpenteBearingArrows();
+  }
 }
 
 function getSelectedCharpenteIds() {
@@ -5328,6 +6493,98 @@ function getSelectedCharpenteIds() {
   }
   return ids;
 }
+
+/**
+ * Reconstruit les options du select (caché) + menu custom sens porteur :
+ * monde X/Y + ⊥ chaque bord détecté de la dalle.
+ * Survol d’une option → aperçu des flèches de portée en 3D.
+ */
+function rebuildCharpenteSensOptions(slabEl, currentSens) {
+  if (!charpenteSensSelect) return;
+  const cur = normalizeCharpenteSens(slabEl, currentSens) || String(currentSens || "");
+  const opts = [
+    { value: "", label: "—" },
+    { value: "X", label: "Sens monde X" },
+    { value: "Y", label: "Sens monde Y" },
+  ];
+  const edges = getSlabEdgeDirs(slabEl);
+  edges.forEach((ed, i) => {
+    const az = Number.isFinite(ed.angleDeg)
+      ? ed.angleDeg
+      : Math.round((Math.atan2(ed.edge?.z || 0, ed.edge?.x || 1) * 180) / Math.PI);
+    opts.push({
+      value: `edge:${i}`,
+      label: ed.label || `⊥ bord ${az}°`,
+    });
+  });
+  if (/^edge:\d+$/i.test(cur) && !opts.some((o) => o.value === cur)) {
+    opts.push({ value: cur, label: `${cur} (ancien)` });
+  }
+  charpenteSensSelect.innerHTML = opts
+    .map(
+      (o) =>
+        `<option value="${escapeHtml(o.value)}"${o.value === cur ? " selected" : ""}>${escapeHtml(o.label)}</option>`
+    )
+    .join("");
+
+  if (charpenteSensMenu) {
+    charpenteSensMenu.innerHTML = "";
+    opts.forEach((o) => {
+      const btn = document.createElement("button");
+      btn.type = "button";
+      btn.className = "sens-dropdown-option";
+      btn.setAttribute("role", "option");
+      btn.dataset.value = o.value;
+      btn.textContent = o.label;
+      if (o.value === cur) btn.classList.add("is-selected");
+      btn.addEventListener("mouseenter", () => {
+        charpenteSensMenu
+          .querySelectorAll(".sens-dropdown-option.is-preview")
+          .forEach((el) => el.classList.remove("is-preview"));
+        btn.classList.add("is-preview");
+        // "" = aucune flèche ; sinon aperçu de ce sens
+        setCharpenteSensPreview(o.value);
+      });
+      btn.addEventListener("mouseleave", () => {
+        btn.classList.remove("is-preview");
+      });
+      btn.addEventListener("click", (ev) => {
+        ev.preventDefault();
+        ev.stopPropagation();
+        setCharpenteSensValue(o.value, { fireChange: true });
+        closeCharpenteSensMenu();
+      });
+      charpenteSensMenu.appendChild(btn);
+    });
+  }
+  syncCharpenteSensToggleLabel();
+}
+
+// Menu custom sens porteur (survol → flèches 3D)
+charpenteSensToggle?.addEventListener("click", (ev) => {
+  ev.preventDefault();
+  ev.stopPropagation();
+  if (charpenteSensMenuOpen) closeCharpenteSensMenu();
+  else openCharpenteSensMenu();
+});
+
+charpenteSensMenu?.addEventListener("mouseleave", () => {
+  if (!charpenteSensMenuOpen) return;
+  setCharpenteSensPreview(null);
+  charpenteSensMenu
+    .querySelectorAll(".sens-dropdown-option.is-preview")
+    .forEach((el) => el.classList.remove("is-preview"));
+});
+
+document.addEventListener("click", (ev) => {
+  if (!charpenteSensMenuOpen) return;
+  if (charpenteSensDropdown?.contains(ev.target)) return;
+  closeCharpenteSensMenu();
+});
+
+document.addEventListener("keydown", (ev) => {
+  if (ev.key === "Escape" && charpenteSensMenuOpen) closeCharpenteSensMenu();
+});
 
 function updateCharpenteAttributesPanel() {
   if (!charpenteAttrsPanel || !charpenteSelectedInfo) return;
@@ -5348,11 +6605,14 @@ function updateCharpenteAttributesPanel() {
 
   const ref = state.charpenteAttributes[ids[0]] || {};
   const slabRef = state.importedElements.find((e) => e.id === ids[0]);
+  rebuildCharpenteSensOptions(slabRef, ref.sens);
   if (charpenteSensSelect) {
-    charpenteSensSelect.value = slabRef
-      ? normalizeCharpenteSens(slabRef, ref.sens)
-      : (ref.sens ?? "");
+    const want = slabRef ? normalizeCharpenteSens(slabRef, ref.sens) : (ref.sens ?? "");
+    charpenteSensSelect.value = want || "";
+    syncCharpenteSensToggleLabel();
   }
+  charpenteSensPreviewValue = null;
+  if (charpenteSensMenuOpen) closeCharpenteSensMenu();
   if (charpenteMatCharpente) charpenteMatCharpente.value = ref.matCharpente ?? "";
   if (charpenteMatVolige) charpenteMatVolige.value = ref.matVolige ?? "";
   if (charpenteMatCouverture) charpenteMatCouverture.value = ref.matCouverture ?? "";
@@ -5392,7 +6652,17 @@ charpenteAttrsApplyBtn?.addEventListener("click", () => {
   ids.forEach((id) => {
     const slabEl = state.importedElements.find((e) => e.id === id);
     const sens = slabEl ? normalizeCharpenteSens(slabEl, sensLabel) : sensLabel;
-    state.charpenteAttributes[id] = { ...attrs, sens };
+    const prev = state.charpenteAttributes[id] || {};
+    state.charpenteAttributes[id] = {
+      ...prev,
+      ...attrs,
+      sens,
+      // conserver override de forme s'il existe
+      formeOverride: prev.formeOverride || undefined,
+    };
+    if (!state.charpenteAttributes[id].formeOverride) {
+      delete state.charpenteAttributes[id].formeOverride;
+    }
   });
   updateCharpenteBearingArrows();
   alert(`Paramètres appliqués à ${ids.length} élément(s) de charpente.`);
@@ -5481,7 +6751,15 @@ murAttrsApplyBtn?.addEventListener("click", () => {
   };
   if (!state.mursAttributes) state.mursAttributes = {};
   ids.forEach((id) => {
-    state.mursAttributes[id] = { ...attrs };
+    const prev = state.mursAttributes[id] || {};
+    state.mursAttributes[id] = {
+      ...prev,
+      ...attrs,
+      formeOverride: prev.formeOverride || undefined,
+    };
+    if (!state.mursAttributes[id].formeOverride) {
+      delete state.mursAttributes[id].formeOverride;
+    }
   });
   alert(`Paramètres appliqués à ${ids.length} mur(s).`);
 });
@@ -5657,7 +6935,37 @@ async function handleViewerClick3D() {
   await handleExpressIdSelectionFrom3D(Number(expressID));
 }
 
-viewerContainer?.addEventListener("click", () => {
+/** Distingue clic rapide (sélection) d'un drag de rotation de la caméra. */
+const VIEWER_DRAG_SELECT_PX = 6;
+let viewerPointerDown = null;
+let viewerPointerDragged = false;
+
+viewerContainer?.addEventListener("pointerdown", (ev) => {
+  if (ev.button !== 0) return;
+  viewerPointerDown = { x: ev.clientX, y: ev.clientY };
+  viewerPointerDragged = false;
+});
+viewerContainer?.addEventListener("pointermove", (ev) => {
+  if (!viewerPointerDown) return;
+  const dx = ev.clientX - viewerPointerDown.x;
+  const dy = ev.clientY - viewerPointerDown.y;
+  if (dx * dx + dy * dy > VIEWER_DRAG_SELECT_PX * VIEWER_DRAG_SELECT_PX) {
+    viewerPointerDragged = true;
+  }
+});
+viewerContainer?.addEventListener("pointerup", () => {
+  viewerPointerDown = null;
+});
+viewerContainer?.addEventListener("pointercancel", () => {
+  viewerPointerDown = null;
+  viewerPointerDragged = false;
+});
+viewerContainer?.addEventListener("click", (ev) => {
+  if (ev.button != null && ev.button !== 0) return;
+  if (viewerPointerDragged) {
+    viewerPointerDragged = false;
+    return;
+  }
   handleViewerClick3D();
 });
 
@@ -5735,31 +7043,33 @@ btnCalcul.addEventListener("click", () => {
 });
 
 function getElementAabb(el) {
-  const cx = toNumberMaybe(el.x);
   const cy = toNumberMaybe(el.y);
-  const cz = toNumberMaybe(el.z);
-  const lx = toNumberMaybe(el.length);
   const hy = toNumberMaybe(el.height);
-  const wz = toNumberMaybe(el.width);
-  if (cx == null || cy == null || cz == null || lx == null || hy == null || wz == null) return null;
-  const halfX = lx / 2;
+  if (cy == null || hy == null) return null;
+  const corners = getElementPlanCornersXZ(el);
+  if (!corners?.length) return null;
+  let minX = Infinity, maxX = -Infinity, minZ = Infinity, maxZ = -Infinity;
+  for (const c of corners) {
+    if (c.x < minX) minX = c.x;
+    if (c.x > maxX) maxX = c.x;
+    if (c.z < minZ) minZ = c.z;
+    if (c.z > maxZ) maxZ = c.z;
+  }
+  if (!Number.isFinite(minX) || !Number.isFinite(minZ)) return null;
   const halfY = hy / 2;
-  const halfZ = wz / 2;
   return {
-    minX: cx - halfX,
-    maxX: cx + halfX,
+    minX,
+    maxX,
     minY: cy - halfY,
     maxY: cy + halfY,
-    minZ: cz - halfZ,
-    maxZ: cz + halfZ,
+    minZ,
+    maxZ,
   };
 }
 
-function aabbOverlap2DXY(a, b) {
+function aabbOverlap2DXY(a, b, eps = 0.05) {
   if (!a || !b) return false;
-  // Dans la scène Three.js du viewer, Y est vertical, le plan au sol est XZ.
-  // On ajoute une petite tolérance en plan pour rattraper les décalages numériques.
-  const eps = 0.05; // 5 cm
+  // Plan horizontal = XZ (Y vertical). eps élargi pour dalles au nu extérieur des murs.
   const overlapX = !(a.maxX < b.minX - eps || a.minX > b.maxX + eps);
   const overlapZ = !(a.maxZ < b.minZ - eps || a.minZ > b.maxZ + eps);
   return overlapX && overlapZ;
@@ -5790,8 +7100,11 @@ function computeAdjacencesMurDalle() {
   murs.forEach((mur) => {
     const boxMur = getElementAabb(mur);
     if (!boxMur) return;
+    // Tolérance : demi-épaisseur mur + marge (dalle à l'axe ou au nu extérieur)
+    const tMur = getWallThickness(mur) || 0.2;
+    const epsPlan = Math.max(0.20, tMur / 2 + 0.15);
     dallesWithBox.forEach(({ slab, box: boxSlab }) => {
-      if (aabbOverlap2DXY(boxMur, boxSlab) && aabbOverlapVertical(boxMur, boxSlab)) {
+      if (aabbOverlap2DXY(boxMur, boxSlab, epsPlan) && aabbOverlapVertical(boxMur, boxSlab)) {
         murDallePairs.push({ murId: mur.id, dalleId: slab.id });
         if (!state.murToSlabs[mur.id]) state.murToSlabs[mur.id] = [];
         state.murToSlabs[mur.id].push(slab.id);
@@ -5804,8 +7117,10 @@ function computeAdjacencesMurDalle() {
   poutres.forEach((poutre) => {
     const boxP = getElementAabb(poutre);
     if (!boxP) return;
+    const tP = getWallThickness(poutre) || 0.2;
+    const epsPlan = Math.max(0.20, tP / 2 + 0.15);
     dallesWithBox.forEach(({ slab, box: boxSlab }) => {
-      if (aabbOverlap2DXY(boxP, boxSlab) && aabbOverlapVertical(boxP, boxSlab)) {
+      if (aabbOverlap2DXY(boxP, boxSlab, epsPlan) && aabbOverlapVertical(boxP, boxSlab)) {
         poutreDallePairs.push({
           poutreId: poutre.id,
           dalleId: slab.id,
@@ -5977,6 +7292,12 @@ function renderAssociationList(murDallePairs, poutreDallePairs, associationListD
   associationListDiv.innerHTML = "";
 
   const murMap = new Map();
+  // Tous les murs apparaissent (même sans dalle adjacente → calcul mur seul possible)
+  state.importedElements
+    .filter((e) => matchesCategory(e, "murs"))
+    .forEach((e) => {
+      if (e?.id != null && !murMap.has(e.id)) murMap.set(e.id, new Set());
+    });
   murDallePairs.forEach(({ murId, dalleId }) => {
     if (!murMap.has(murId)) murMap.set(murId, new Set());
     murMap.get(murId).add(dalleId);
@@ -5993,49 +7314,16 @@ function renderAssociationList(murDallePairs, poutreDallePairs, associationListD
   state.associationMask.poutres = {};
   state.associationCounters.murs = {};
   state.associationCounters.poutres = {};
-  // IMPORTANT: on NE réinitialise PAS les configs (arases/dalles/stacks) ici,
-  // afin qu'elles restent cochées quand on navigue entre onglets.
+  // IMPORTANT: on NE réinitialise PAS wallCalcConfig ici (persistance entre onglets).
+  if (!state.wallCalcConfig || !state.wallCalcConfig.murs) {
+    state.wallCalcConfig = { murs: {} };
+  }
   if (!state.wallAraseConfig || !state.wallAraseConfig.murs) {
     state.wallAraseConfig = { murs: {} };
   }
   if (!state.poutreStackConfig) {
     state.poutreStackConfig = {};
   }
-
-  const ensureWallAraseConfig = (murId, araseCount, slabIds) => {
-    if (!state.wallAraseConfig.murs[murId]) {
-      state.wallAraseConfig.murs[murId] = [];
-    }
-    const arr = state.wallAraseConfig.murs[murId];
-    for (let i = 0; i < araseCount; i++) {
-      if (!arr[i]) {
-        arr[i] = { enabled: false, slabs: {}, stackRefs: {} };
-      }
-      ensureWallStackRefs(arr[i]);
-      const slabsCfg = arr[i].slabs;
-      slabIds.forEach((sid) => {
-        if (!slabsCfg[sid]) {
-          slabsCfg[sid] = { enabled: false, stacks: [false, false, false] };
-        }
-      });
-    }
-  };
-
-  const recomputeWallMaskFromConfig = (murId) => {
-    const cfgArr = state.wallAraseConfig.murs[murId];
-    const set = new Set();
-    if (cfgArr && Array.isArray(cfgArr)) {
-      cfgArr.forEach((cfg) => {
-        if (!cfg || !cfg.enabled) return;
-        Object.entries(cfg.slabs || {}).forEach(([sidStr, info]) => {
-          const sid = Number(sidStr);
-          if (!Number.isFinite(sid)) return;
-          if (info && info.enabled) set.add(sid);
-        });
-      });
-    }
-    state.associationMask.murs[murId] = set;
-  };
 
   const createCarrierBlock = (typeLabel, id, slabSet, category) => {
     const container = document.createElement("div");
@@ -6055,7 +7343,6 @@ function renderAssociationList(murDallePairs, poutreDallePairs, associationListD
     header.style.gap = "0.35rem";
     header.style.fontSize = "0.78rem";
     header.style.fontWeight = "500";
-    header.style.cursor = "pointer";
     header.style.marginBottom = "0.25rem";
 
     const toggleArrow = document.createElement("span");
@@ -6067,219 +7354,258 @@ function renderAssociationList(murDallePairs, poutreDallePairs, associationListD
 
     const headerLabel = document.createElement("span");
     headerLabel.textContent = `${typeLabel} ${id}`;
+    headerLabel.style.cursor = "pointer";
+    headerLabel.style.flex = "1";
 
     header.appendChild(toggleArrow);
     header.appendChild(headerLabel);
-    container.appendChild(header);
 
-    // Contenu rétractable (arases + dalles)
     const content = document.createElement("div");
     content.className = "assoc-carrier-content";
     content.style.display = "block";
+
+    if (category === "mur") {
+      const araseBtn = document.createElement("button");
+      araseBtn.type = "button";
+      araseBtn.textContent = "Arases";
+      araseBtn.title = "Mettre en évidence toutes les arases du mur (légende couleurs)";
+      araseBtn.style.cssText =
+        "font-size:0.62rem;padding:0.12rem 0.35rem;border-radius:0.3rem;border:1px solid rgba(148,163,184,0.5);background:#1e293b;color:#e2e8f0;cursor:pointer;";
+      araseBtn.addEventListener("click", (ev) => {
+        ev.stopPropagation();
+        if (state.araseLegendMurId === id) {
+          clearAraseLegendBoxes();
+          const old = content.querySelector("#arase-legend-overlay");
+          if (old) old.remove();
+          return;
+        }
+        const overlay = showAraseLegendForMur(id);
+        const prev = content.querySelector("#arase-legend-overlay");
+        if (prev) prev.remove();
+        if (overlay) content.insertBefore(overlay, content.firstChild);
+      });
+      header.appendChild(araseBtn);
+
+      headerLabel.addEventListener("mouseenter", async () => {
+        await updateHoverHighlight(id);
+      });
+      headerLabel.addEventListener("mouseleave", () => {
+        clearHoverHighlight();
+      });
+    }
+
+    container.appendChild(header);
     container.appendChild(content);
 
-    // Pour les murs, afficher la liste des arases avec configuration par dalle / stack
+    // --- MURS : compteur de stacks + réfs + dalles par stack ---
     if (category === "mur") {
       const el = state.importedElements.find((e) => e.id === id);
-      const arases = el && Array.isArray(el.araseHeights) ? el.araseHeights : null;
-      const segHeights =
-        el && Array.isArray(el.heightSegments) && el.heightSegments.length > 0
-          ? el.heightSegments
-          : null;
-      const sourceHeights = arases || segHeights;
       const slabIds = Array.from(slabSet);
-      const araseCount = sourceHeights ? sourceHeights.length : 0;
-      if (el && sourceHeights && araseCount > 0) {
-        ensureWallAraseConfig(id, araseCount, slabIds);
+      const cfg = ensureWallCalcConfig(id, slabIds);
+      recomputeWallMaskFromCalcConfig(id);
 
-        sourceHeights.forEach((h, index) => {
-          const cfgArr = state.wallAraseConfig.murs[id];
-          const cfg = cfgArr[index];
+      const murRoofKind = el ? classifyWallRoofFromProfiles(el).kind : "Mur";
+      const isPignonOrRampant = murRoofKind === "Pignon" || murRoofKind === "Rampant";
 
-          const araseBlock = document.createElement("div");
-          araseBlock.className = "assoc-arase-block";
-          araseBlock.style.borderTop = "1px solid rgba(55,65,81,0.6)";
-          araseBlock.style.marginTop = "0.25rem";
-          araseBlock.style.paddingTop = "0.25rem";
+      const countRow = document.createElement("div");
+      countRow.style.cssText =
+        "display:flex;align-items:center;gap:0.4rem;font-size:0.7rem;color:#cbd5e1;margin:0.2rem 0 0.35rem;";
+      const countLab = document.createElement("span");
+      countLab.textContent = "Stacks de calcul";
+      const countInput = document.createElement("input");
+      countInput.type = "number";
+      countInput.min = "0";
+      countInput.max = String(WALL_CALC_STACK_MAX);
+      countInput.value = String(cfg.stackCount);
+      countInput.style.cssText = "width:3.2rem;font-size:0.7rem;";
+      countRow.appendChild(countLab);
+      countRow.appendChild(countInput);
+      content.appendChild(countRow);
 
-          const araseHeader = document.createElement("div");
-          araseHeader.style.display = "flex";
-          araseHeader.style.alignItems = "center";
-          araseHeader.style.justifyContent = "space-between";
-          araseHeader.style.fontSize = "0.7rem";
+      const stacksHost = document.createElement("div");
+      stacksHost.className = "assoc-mur-stacks";
+      content.appendChild(stacksHost);
 
-          const araseLeft = document.createElement("label");
-          araseLeft.style.display = "flex";
-          araseLeft.style.alignItems = "center";
-          araseLeft.style.gap = "0.35rem";
-
-          const araseCb = document.createElement("input");
-          araseCb.type = "checkbox";
-          araseCb.checked = !!cfg.enabled;
-
-          const labelPrefix = arases ? "Arase" : "Segment";
-          const araseText = document.createElement("span");
-          araseText.textContent = `${labelPrefix} ${index + 1} (${formatNum(h)} m)`;
-
-          araseLeft.appendChild(araseCb);
-          araseLeft.appendChild(araseText);
-          araseHeader.appendChild(araseLeft);
-
-          const stacksInfo = document.createElement("span");
-          stacksInfo.textContent = "Stacks 1 / 2 / 3";
-          stacksInfo.style.fontSize = "0.65rem";
-          stacksInfo.style.color = "#9ca3af";
-          araseHeader.appendChild(stacksInfo);
-
-          araseBlock.appendChild(araseHeader);
-
-          // Survol de l'arase : volume jaune approximatif du tronçon de mur correspondant
-          araseHeader.addEventListener("mouseenter", () => {
-            const prevIndex = state.selectedWallSegments[id];
-            state.selectedWallSegments[id] = index;
-            const elHover = state.importedElements.find((e) => e.id === id);
-            showAraseHoverBox(elHover, index);
-            updateSlabLabels();
-            state.selectedWallSegments[id] = prevIndex ?? index;
+      const buildRefOptions = (includeUser) => {
+        if (isPignonOrRampant) {
+          const opts = [
+            { v: WALL_REF_PIGNON_POINTE, label: "Pointe de pignon" },
+            { v: WALL_REF_PIGNON_BAS, label: "Bas de pente" },
+            { v: WALL_REF_PIED, label: "Pied de mur" },
+            { v: WALL_REF_SLAB_MAX, label: "Dalle la plus haute (stack)" },
+            { v: WALL_REF_SLAB_MIN, label: "Dalle la plus basse (stack)" },
+          ];
+          if (includeUser) {
+            opts.push({ v: WALL_REF_USER, label: "Donnée utilisateur (Lh → hcalc=Lh/2)" });
+          }
+          slabIds.forEach((sid) => {
+            opts.push({ v: `${WALL_REF_SLAB_PREFIX}${sid}`, label: `Dalle n° ${sid}` });
           });
-          araseHeader.addEventListener("mouseleave", () => {
-            clearHoverHighlight();
-            updateSlabLabels();
-          });
-
-          const araseBody = document.createElement("div");
-          araseBody.style.marginTop = "0.25rem";
-          araseBody.style.marginLeft = "1.25rem"; // retrait visuel des dalles vs l’arase
-          araseBody.style.display = cfg.enabled ? "block" : "none";
-
-          slabIds.forEach((slabId) => {
-            const slabCfg = cfg.slabs[slabId];
-            const row = document.createElement("div");
-            row.dataset.slabRow = String(slabId);
-            row.style.display = "grid";
-            row.style.gridTemplateColumns = "minmax(0, 1.2fr) repeat(3, 1.1rem)";
-            row.style.alignItems = "center";
-            row.style.columnGap = "0.25rem";
-            row.style.fontSize = "0.7rem";
-            row.style.color = "#e5e7eb";
-            row.style.marginBottom = "0.15rem";
-
-            const slabLabel = document.createElement("label");
-            slabLabel.style.display = "flex";
-            slabLabel.style.alignItems = "center";
-            slabLabel.style.gap = "0.3rem";
-
-            const slabCb = document.createElement("input");
-            slabCb.type = "checkbox";
-            slabCb.checked = !!slabCfg.enabled;
-
-            const slabRowEl = state.importedElements.find((e) => e.id === slabId);
-            const sens = state.charpenteAttributes?.[slabId]?.sens || "";
-            const rampante = el && slabRowEl && isSlabRampantePourMurPignon(el, slabRowEl, sens);
-
-            const slabText = document.createElement("span");
-            slabText.textContent = `Dalle ${slabId}`;
-            slabLabel.appendChild(slabCb);
-            slabLabel.appendChild(slabText);
-            if (rampante) {
-              const tag = document.createElement("span");
-              tag.textContent = "rampante";
-              tag.style.fontSize = "0.62rem";
-              tag.style.color = "#a5b4fc";
-              tag.style.marginLeft = "0.28rem";
-              tag.style.fontStyle = "italic";
-              slabLabel.appendChild(tag);
-            }
-            row.appendChild(slabLabel);
-
-            const stackChecks = [];
-            for (let si = 0; si < 3; si++) {
-              const scb = document.createElement("input");
-              scb.type = "checkbox";
-              scb.checked = !!slabCfg.stacks[si];
-              scb.title = `Stack ${si + 1}`;
-              scb.addEventListener("change", () => {
-                slabCfg.stacks[si] = scb.checked;
-                renderWallAraseStackRefSection(id, index, cfg, slabIds, araseBody);
-              });
-              scb.disabled = !slabCb.checked || !cfg.enabled;
-              stackChecks.push(scb);
-              row.appendChild(scb);
-            }
-
-            slabCb.addEventListener("change", () => {
-              slabCfg.enabled = slabCb.checked;
-              stackChecks.forEach((scb, si) => {
-                if (slabCb.checked && !slabCfg.stacks.some(Boolean)) {
-                  // Par défaut, coche le stack 1 si aucun n'est encore choisi
-                  if (si === 0) {
-                    slabCfg.stacks[0] = true;
-                    scb.checked = true;
-                  }
-                }
-                scb.disabled = !slabCb.checked || !cfg.enabled;
-              });
-              recomputeWallMaskFromConfig(id);
-              renderWallAraseStackRefSection(id, index, cfg, slabIds, araseBody);
-              if (currentMainTab === "resultats") {
-                recomputeSlabSelectionFromWalls();
-                renderElementsTables();
-                updateHighlight();
-                updateSlabLabels();
-              }
-            });
-
-            araseBody.appendChild(row);
-          });
-
-          renderWallAraseStackRefSection(id, index, cfg, slabIds, araseBody);
-
-          araseCb.addEventListener("change", () => {
-            cfg.enabled = araseCb.checked;
-            araseBody.style.display = cfg.enabled ? "block" : "none";
-            if (!cfg.enabled) {
-              Object.values(cfg.slabs).forEach((slabCfg) => {
-                slabCfg.enabled = false;
-                slabCfg.stacks = [false, false, false];
-              });
-              araseBody.querySelectorAll("input[type=\"checkbox\"]").forEach((input) => {
-                input.checked = false;
-                input.disabled = true;
-              });
-            } else {
-              const slabRows = araseBody.querySelectorAll("div[data-slab-row]");
-              slabRows.forEach((row) => {
-                const inputs = row.querySelectorAll("input[type=\"checkbox\"]");
-                if (!inputs.length) return;
-                const slabCb2 = inputs[0];
-                slabCb2.checked = true;
-                slabCb2.disabled = false;
-                inputs.forEach((scb2, idx2) => {
-                  if (idx2 === 0) return;
-                  const stackIndex2 = idx2 - 1;
-                  scb2.disabled = false;
-                  if (stackIndex2 === 0) scb2.checked = true;
-                });
-              });
-              Object.values(cfg.slabs).forEach((slabCfg) => {
-                slabCfg.enabled = true;
-                slabCfg.stacks = [true, false, false];
-              });
-            }
-            recomputeWallMaskFromConfig(id);
-            renderWallAraseStackRefSection(id, index, cfg, slabIds, araseBody);
-            if (currentMainTab === "resultats") {
-              recomputeSlabSelectionFromWalls();
-              renderElementsTables();
-              updateHighlight();
-              updateSlabLabels();
-            }
-          });
-
-          araseBlock.appendChild(araseBody);
-          content.appendChild(araseBlock);
+          return opts;
+        }
+        const opts = [
+          { v: WALL_REF_ARASE, label: "Arase du mur (libre en tête)" },
+          { v: WALL_REF_PIED, label: "Pied de mur" },
+          { v: WALL_REF_SLAB_MAX, label: "Dalle la plus haute (stack)" },
+          { v: WALL_REF_SLAB_MIN, label: "Dalle la plus basse (stack)" },
+        ];
+        if (includeUser) {
+          opts.push({ v: WALL_REF_USER, label: "Donnée utilisateur (Lh → hcalc=Lh/2)" });
+        }
+        slabIds.forEach((sid) => {
+          opts.push({ v: `${WALL_REF_SLAB_PREFIX}${sid}`, label: `Dalle n° ${sid}` });
         });
-      }
+        return opts;
+      };
+
+      const renderMurStacks = () => {
+        ensureWallCalcConfig(id, slabIds);
+        if (isPignonOrRampant) {
+          cfg.stacks.forEach((st) => {
+            if (st.refHaute === WALL_REF_ARASE) st.refHaute = WALL_REF_PIGNON_POINTE;
+            if (st.refBasse === WALL_REF_ARASE) st.refBasse = WALL_REF_PIGNON_BAS;
+          });
+        }
+        stacksHost.innerHTML = "";
+        if (!cfg.stackCount) {
+          const hint = document.createElement("div");
+          hint.style.cssText = "font-size:0.65rem;color:#94a3b8;font-style:italic;";
+          hint.textContent = "Aucun stack : augmente le compteur pour lancer des cas de calcul.";
+          stacksHost.appendChild(hint);
+          recomputeWallMaskFromCalcConfig(id);
+          return;
+        }
+        const refOptsHaute = buildRefOptions(true);
+        const refOptsBasse = buildRefOptions(false);
+        cfg.stacks.forEach((st, si) => {
+          if (String(st.refBasse || "").trim() === WALL_REF_USER) {
+            st.refBasse = WALL_REF_PIED;
+            st.userBasse = "";
+          }
+          const block = document.createElement("div");
+          block.style.cssText =
+            "border-top:1px solid rgba(55,65,81,0.6);margin-top:0.3rem;padding-top:0.3rem;";
+          const title = document.createElement("div");
+          title.textContent = `Stack ${si + 1}`;
+          title.style.cssText = "font-size:0.7rem;font-weight:600;color:#e2e8f0;margin-bottom:0.2rem;";
+          block.appendChild(title);
+
+          const makeRefRow = (labelText, field, userField, opts) => {
+            const wrap = document.createElement("div");
+            wrap.style.marginBottom = "0.15rem";
+            const row = document.createElement("div");
+            row.style.cssText =
+              "display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1.4fr);gap:0.35rem;align-items:center;font-size:0.66rem;";
+            const lab = document.createElement("span");
+            lab.textContent = labelText;
+            lab.style.color = "#94a3b8";
+            const sel = document.createElement("select");
+            sel.style.fontSize = "0.66rem";
+            opts.forEach((o) => {
+              const opt = document.createElement("option");
+              opt.value = o.v;
+              opt.textContent = o.label;
+              if (st[field] === o.v) opt.selected = true;
+              sel.appendChild(opt);
+            });
+            row.appendChild(lab);
+            row.appendChild(sel);
+            wrap.appendChild(row);
+            const userWrap = document.createElement("div");
+            userWrap.style.cssText = "margin:0.15rem 0 0 0;display:none;";
+            const userInp = document.createElement("input");
+            userInp.type = "number";
+            userInp.step = "0.01";
+            userInp.min = "0";
+            userInp.placeholder = "Hauteur relative Lh (m) → hcalc = Lh/2";
+            userInp.title = "Hauteur relative complète ; le calcul utilise hcalc = Lh/2 pour la masse mur.";
+            userInp.value = st[userField] || "";
+            userInp.style.cssText = "width:100%;font-size:0.66rem;";
+            userWrap.appendChild(userInp);
+            wrap.appendChild(userWrap);
+            const syncUser = () => {
+              userWrap.style.display = st[field] === WALL_REF_USER ? "block" : "none";
+            };
+            syncUser();
+            sel.addEventListener("change", () => {
+              st[field] = sel.value;
+              syncUser();
+            });
+            userInp.addEventListener("change", () => {
+              st[userField] = userInp.value;
+            });
+            return wrap;
+          };
+
+          block.appendChild(makeRefRow("Référence haute =", "refHaute", "userHaute", refOptsHaute));
+          block.appendChild(makeRefRow("Référence basse =", "refBasse", "userBasse", refOptsBasse));
+
+          const slabsTitle = document.createElement("div");
+          slabsTitle.textContent = "Dalles du stack (décocher = hors masse ; aucune = mur seul)";
+          slabsTitle.style.cssText = "font-size:0.62rem;color:#94a3b8;margin:0.25rem 0 0.15rem;";
+          block.appendChild(slabsTitle);
+
+          if (!slabIds.length) {
+            const none = document.createElement("div");
+            none.style.cssText = "font-size:0.65rem;color:#64748b;";
+            none.textContent = "Aucune dalle adjacente détectée.";
+            block.appendChild(none);
+          } else {
+            slabIds.forEach((sid) => {
+              const lab = document.createElement("label");
+              lab.style.cssText =
+                "display:flex;align-items:center;gap:0.3rem;font-size:0.68rem;color:#e5e7eb;margin:0.08rem 0;";
+              const cb = document.createElement("input");
+              cb.type = "checkbox";
+              cb.checked = !!st.slabs[sid];
+              const slabEl = state.importedElements.find((e) => e.id === sid);
+              const sens = state.charpenteAttributes?.[sid]?.sens || "";
+              const rampante = el && slabEl && isSlabRampantePourMurPignon(el, slabEl, sens);
+              const txt = document.createElement("span");
+              txt.textContent = `Dalle ${sid}`;
+              lab.appendChild(cb);
+              lab.appendChild(txt);
+              if (rampante) {
+                const tag = document.createElement("span");
+                tag.textContent = "rampante";
+                tag.style.cssText = "font-size:0.6rem;color:#a5b4fc;font-style:italic;margin-left:0.2rem;";
+                lab.appendChild(tag);
+              }
+              cb.addEventListener("change", () => {
+                st.slabs[sid] = cb.checked;
+                recomputeWallMaskFromCalcConfig(id);
+                if (currentMainTab === "resultats") {
+                  recomputeSlabSelectionFromWalls();
+                  renderElementsTables();
+                  updateHighlight();
+                  updateSlabLabels();
+                }
+              });
+              block.appendChild(lab);
+            });
+          }
+          stacksHost.appendChild(block);
+        });
+        recomputeWallMaskFromCalcConfig(id);
+      };
+
+      countInput.addEventListener("change", () => {
+        let n = Number(countInput.value);
+        if (!Number.isFinite(n)) n = 0;
+        n = Math.max(0, Math.min(WALL_CALC_STACK_MAX, Math.floor(n)));
+        countInput.value = String(n);
+        cfg.stackCount = n;
+        ensureWallCalcConfig(id, slabIds);
+        renderMurStacks();
+        if (currentMainTab === "resultats") {
+          recomputeSlabSelectionFromWalls();
+          renderElementsTables();
+          updateHighlight();
+          updateSlabLabels();
+        }
+      });
+
+      renderMurStacks();
     }
 
     // Pour les poutres, appliquer un principe similaire de stacks par dalle
@@ -6297,7 +7623,9 @@ function renderAssociationList(murDallePairs, poutreDallePairs, associationListD
       const cfgBySlab = state.poutreStackConfig[id];
       ids.forEach((slabId) => {
         if (!cfgBySlab[slabId]) {
-          cfgBySlab[slabId] = { enabled: true, stacks: [true, false, false] };
+          cfgBySlab[slabId] = { enabled: true, stacks: [true, false, false], takeMass: true };
+        } else if (cfgBySlab[slabId].takeMass === undefined) {
+          cfgBySlab[slabId].takeMass = true;
         }
       });
 
@@ -6330,6 +7658,17 @@ function renderAssociationList(murDallePairs, poutreDallePairs, associationListD
         stackWrapper.style.display = "flex";
         stackWrapper.style.gap = "0.2rem";
         stackWrapper.style.marginLeft = "0.5rem";
+        stackWrapper.style.alignItems = "center";
+
+        const massCb = document.createElement("input");
+        massCb.type = "checkbox";
+        massCb.checked = slabCfg.takeMass !== false;
+        massCb.title = "Masse charpente (décocher = associée sans masse)";
+        massCb.disabled = !cb.checked;
+        massCb.addEventListener("change", () => {
+          slabCfg.takeMass = massCb.checked;
+        });
+        stackWrapper.appendChild(massCb);
 
         const stackChecks = [];
         for (let si = 0; si < 3; si++) {
@@ -6360,6 +7699,7 @@ function renderAssociationList(murDallePairs, poutreDallePairs, associationListD
           } else {
             set.delete(sid);
           }
+          massCb.disabled = !cb.checked;
           stackChecks.forEach((scb) => {
             scb.disabled = !cb.checked;
           });
@@ -6416,7 +7756,7 @@ function renderAssociationList(murDallePairs, poutreDallePairs, associationListD
   if (!murMap.size && !poutreMap.size) {
     const p = document.createElement("p");
     p.textContent =
-      "Aucune interaction mur/dalle ou poutre/dalle détectée avec le critère actuel (chevauchement en plan).";
+      "Aucun mur / poutre importé pour l’association.";
     p.style.marginTop = "0.4rem";
     p.style.fontSize = "0.72rem";
     p.style.color = "#f97316";
@@ -6431,7 +7771,23 @@ function renderAssociationList(murDallePairs, poutreDallePairs, associationListD
   }
 
   if (btnCalculFinal) {
-    btnCalculFinal.disabled = !murMap.size && !poutreMap.size;
+    // Actif dès qu’au moins un mur a stackCount>0 ou une poutre a un stack dalle
+    let hasCase = false;
+    for (const murId of murMap.keys()) {
+      const c = state.wallCalcConfig?.murs?.[murId];
+      if (c && c.stackCount > 0) { hasCase = true; break; }
+    }
+    if (!hasCase) {
+      for (const [poutreId, bySlab] of Object.entries(state.poutreStackConfig || {})) {
+        if (Object.values(bySlab || {}).some((inf) => inf?.enabled && inf.stacks?.some(Boolean))) {
+          hasCase = true;
+          break;
+        }
+      }
+    }
+    btnCalculFinal.disabled = !hasCase && !murMap.size;
+    // Toujours permettre d’ouvrir les masses si des murs existent (l’utilisateur peut ajouter des stacks)
+    if (murMap.size || poutreMap.size) btnCalculFinal.disabled = false;
   }
 }
 
@@ -6469,12 +7825,15 @@ btnReset.addEventListener("click", () => {
 
   updateSeismicFactorsFromSelectors();
 
+  try { clearAraseLegendBoxes(); } catch (_) {}
   state.ifcLoaded = false;
   state.loadedModel = null;
   state.modelOffsetY = 0;
   state.mursPorteurs = [];
   state.niveaux = [];
   state.importedElements = [];
+  state.wallCalcConfig = { murs: {} };
+  state.wallAraseConfig = { murs: {} };
   btnCalcul.disabled = true;
 
   if (elementsPanel) elementsPanel.style.display = "none";

@@ -3,13 +3,20 @@
   <head>
     <meta charset="UTF-8" />
     <title>Efforts en tête de mur - IFC</title>
-    <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <link rel="icon" type="image/png" href="/favicon-96x96.png" sizes="96x96" />
-    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
-    <link rel="shortcut icon" href="/favicon.ico" />
-    <link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png" />
-    <meta name="apple-mobile-web-app-title" content="Calcul GPH" />
-    <link rel="manifest" href="/site.webmanifest" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <meta name="description" content="Calcul des efforts en tête de mur à partir d'un modèle IFC (sismique, associations, ancrages)." />
+    <meta name="theme-color" content="#000000" />
+    <meta name="color-scheme" content="dark" />
+    <meta name="mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+    <meta name="apple-mobile-web-app-title" content="Effort mur" />
+    <meta name="application-name" content="Effort mur" />
+    <link rel="icon" type="image/png" href="./favicon-96x96.png" sizes="96x96" />
+    <link rel="icon" type="image/svg+xml" href="./favicon.svg" />
+    <link rel="shortcut icon" href="./favicon.ico" />
+    <link rel="apple-touch-icon" sizes="180x180" href="./apple-touch-icon.png" />
+    <link rel="manifest" href="./site.webmanifest" />
     <style>
       * {
         box-sizing: border-box;
@@ -715,6 +722,83 @@
       .field select:focus {
         border-color: #22c55e;
         box-shadow: 0 0 0 1px rgba(34, 197, 94, 0.4);
+      }
+
+      /* Liste custom sens porteur : survol → aperçu flèches 3D */
+      .sens-dropdown {
+        position: relative;
+        width: 100%;
+      }
+      .sens-dropdown-toggle {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        width: 100%;
+        padding: 0.25rem 0.4rem;
+        border-radius: 0.4rem;
+        border: 1px solid rgba(148, 163, 184, 0.6);
+        background: rgba(15, 23, 42, 0.95);
+        color: #e5e7eb;
+        font-size: inherit;
+        font-family: inherit;
+        cursor: pointer;
+        text-align: left;
+        gap: 0.35rem;
+      }
+      .sens-dropdown-toggle:focus {
+        border-color: #22c55e;
+        box-shadow: 0 0 0 1px rgba(34, 197, 94, 0.4);
+        outline: none;
+      }
+      .sens-dropdown-toggle::after {
+        content: "▾";
+        color: #94a3b8;
+        font-size: 0.7rem;
+        flex-shrink: 0;
+      }
+      .sens-dropdown-menu {
+        position: absolute;
+        z-index: 40;
+        left: 0;
+        right: 0;
+        top: calc(100% + 2px);
+        max-height: 14rem;
+        overflow: auto;
+        border-radius: 0.4rem;
+        border: 1px solid rgba(148, 163, 184, 0.55);
+        background: rgba(15, 23, 42, 0.98);
+        box-shadow: 0 8px 24px rgba(0, 0, 0, 0.45);
+        padding: 0.15rem 0;
+      }
+      .sens-dropdown-menu[hidden] {
+        display: none !important;
+      }
+      .sens-dropdown-option {
+        display: block;
+        width: 100%;
+        padding: 0.28rem 0.5rem;
+        border: none;
+        background: transparent;
+        color: #e5e7eb;
+        font-size: 0.72rem;
+        font-family: inherit;
+        text-align: left;
+        cursor: pointer;
+      }
+      .sens-dropdown-option:hover,
+      .sens-dropdown-option.is-preview {
+        background: rgba(124, 58, 237, 0.28);
+      }
+      .sens-dropdown-option.is-selected {
+        color: #c4b5fd;
+        font-weight: 600;
+      }
+      .sens-dropdown-hint {
+        display: block;
+        margin-top: 0.2rem;
+        font-size: 0.62rem;
+        color: #94a3b8;
+        line-height: 1.25;
       }
 
       .button-row {
@@ -1443,7 +1527,7 @@
 
         <div id="tab-masses" class="tab-panel">
           <small>
-            Résultats intermédiaires : masses prises en compte par mur/arase/stack (et poutres) selon tes sélections.
+            Résultats intermédiaires : masses par mur/stack (réf. haute &amp; basse rappelées) et poutres selon tes sélections.
           </small>
           <div id="mass-results" style="margin-top:0.6rem;"></div>
           <div class="button-row" style="margin-top:0.8rem; display:flex; flex-wrap:wrap; gap:0.5rem; justify-content:flex-end;">
@@ -1505,8 +1589,9 @@
         <div class="results" id="results">
           <h3>Association murs / poutres / dalles</h3>
           <p style="margin-top:0.25rem; font-size:0.75rem; color:#9ca3af;">
-            Sélectionne un mur ou une poutre pour visualiser les dalles associées. Utilise les cases à cocher pour
-            choisir quelles dalles seront prises en compte lors du calcul final.
+            Par mur : survol = surbrillance 3D, clic = sélection mur + dalles. Définis le nombre de <b>stacks</b> (0–10),
+            puis pour chaque stack les réf. haute/basse et les dalles cochées. Aucune dalle cochée = effort sur masse mur seule.
+            Le bouton <b>Arases</b> affiche les tronçons colorés en 3D avec légende.
           </p>
 
           <div id="association-list" style="margin-top:0.6rem;">
@@ -1562,12 +1647,17 @@
 
             <div class="charpente-attrs-grid">
               <div class="field">
-                <label for="charpente-sens">Sens porteur</label>
-                <select id="charpente-sens">
+                <label for="charpente-sens-toggle">Sens porteur</label>
+                <select id="charpente-sens" title="X/Y monde + un sens ⊥ par direction de bord du contour (2 rectangle, 3 triangle/trapèze…)" aria-hidden="true" tabindex="-1" style="position:absolute;width:1px;height:1px;opacity:0;pointer-events:none;overflow:hidden;">
                   <option value="">—</option>
-                  <option value="X">Sens X</option>
-                  <option value="Y">Sens Y</option>
+                  <option value="X">Sens monde X</option>
+                  <option value="Y">Sens monde Y</option>
                 </select>
+                <div class="sens-dropdown" id="charpente-sens-dropdown">
+                  <button type="button" class="sens-dropdown-toggle" id="charpente-sens-toggle" aria-haspopup="listbox" aria-expanded="false">—</button>
+                  <div class="sens-dropdown-menu" id="charpente-sens-menu" role="listbox" hidden></div>
+                </div>
+                <span class="sens-dropdown-hint">Survole une option pour prévisualiser les flèches de portée en 3D.</span>
               </div>
 
               <div class="field">
@@ -1923,8 +2013,43 @@
       GPH tout droit réservé
     </footer>
 
-    <!-- Version de build de la page : V1.1.8 -->
-    <script type="module" src="./main.js?v=1.1.8"></script>
+    <!-- Version de build de la page : V1.2.00 -->
+    <script type="module" src="./main.js?v=1.2.00"></script>
+    <script>
+      // Enregistrement du Service Worker (PWA)
+      if ("serviceWorker" in navigator) {
+        window.addEventListener("load", () => {
+          navigator.serviceWorker
+            .register("./sw.js")
+            .then((reg) => {
+              // Détecte une nouvelle version du SW et active dès que possible
+              if (reg.waiting) {
+                reg.waiting.postMessage("SKIP_WAITING");
+              }
+              reg.addEventListener("updatefound", () => {
+                const nw = reg.installing;
+                if (!nw) return;
+                nw.addEventListener("statechange", () => {
+                  if (nw.state === "installed" && navigator.serviceWorker.controller) {
+                    // Nouvelle version prête : on demande l'activation
+                    nw.postMessage("SKIP_WAITING");
+                  }
+                });
+              });
+            })
+            .catch((err) => console.warn("SW registration failed:", err));
+
+          // Recharge uniquement lors d'une mise à jour (pas à la 1re installation)
+          const hadController = !!navigator.serviceWorker.controller;
+          let refreshing = false;
+          navigator.serviceWorker.addEventListener("controllerchange", () => {
+            if (refreshing || !hadController) return;
+            refreshing = true;
+            window.location.reload();
+          });
+        });
+      }
+    </script>
   </body>
   </html>
 
